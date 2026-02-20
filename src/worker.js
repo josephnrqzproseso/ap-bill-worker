@@ -1,3 +1,4 @@
+// @ts-nocheck
 const { config } = require("./config");
 const { OdooClient, kwWithCompany } = require("./odoo");
 const {
@@ -546,7 +547,9 @@ async function safeMessagePost(odoo, companyId, model, resId, body) {
       [[Number(resId)]],
       kwWithCompany(companyId, {
         body: String(body || ""),
-        message_type: "comment"
+        message_type: "comment",
+        subtype_xmlid: "mail.mt_note",
+        body_is_html: true
       })
     );
   } catch (_err) {
@@ -746,7 +749,7 @@ async function loadExpenseAccounts(odoo, companyId) {
       "account.account",
       [
         ["company_id", "=", companyId],
-        ["account_type", "in", ["expense", "expense_direct_cost"]],
+        ["account_type", "in", ["expense", "expense_direct_cost", "expense_depreciation", "asset_current"]],
         ["deprecated", "=", false]
       ],
       ["id", "code", "name"],
@@ -949,9 +952,14 @@ async function resolveExpenseAccountId({
   geminiPick, expenseAccounts, accountMapping, targetDb,
   lineDescription, vendorName
 }) {
-  // Tier 1: vendor default
+  // Tier 1: vendor default (skip if it's a generic account like Admin Expense)
   const vendorAcct = await getVendorDefaultAccountId(odoo, companyId, vendorId);
-  if (vendorAcct) return { accountId: vendorAcct, source: "vendor_default" };
+  if (vendorAcct && expenseAccounts?.length) {
+    const vendorAcctObj = expenseAccounts.find((a) => a.id === vendorAcct);
+    if (vendorAcctObj && !isGenericAccount(vendorAcctObj)) {
+      return { accountId: vendorAcct, source: "vendor_default" };
+    }
+  }
 
   // Tier 2: Gemini pick (validated + repaired via code/name, anti-generic guard)
   if (geminiPick && expenseAccounts?.length) {
@@ -977,7 +985,31 @@ async function resolveExpenseAccountId({
     if (fuzzy) return { accountId: fuzzy, source: "fuzzy_match" };
   }
 
-  // Tier 6: env fallback
+  // Tier 6: Gemini pick even if generic (still better than Odoo's blind default)
+  if (geminiPick && expenseAccounts?.length) {
+    const primaryId = resolveGeminiCandidate(geminiPick, expenseAccounts);
+    if (primaryId) return { accountId: primaryId, source: "gemini_last_resort" };
+  }
+
+  // Tier 7: best non-generic expense account matching any keyword from description/category/vendor
+  if (expenseAccounts?.length) {
+    const combined = [suggestedName, lineDescription, category, vendorName].filter(Boolean).join(" ").toLowerCase();
+    const words = combined.split(/[\s&,/_\-()]+/).filter((w) => w.length > 2);
+    const nonGeneric = expenseAccounts.filter((a) => !isGenericAccount(a));
+    if (nonGeneric.length) {
+      let bestId = 0, bestHits = 0;
+      for (const acct of nonGeneric) {
+        const hay = `${acct.code} ${acct.name}`.toLowerCase();
+        const hits = words.filter((w) => hay.includes(w)).length;
+        if (hits > bestHits) { bestHits = hits; bestId = acct.id; }
+      }
+      if (bestId) return { accountId: bestId, source: "keyword_last_resort" };
+      return { accountId: nonGeneric[0].id, source: "first_non_generic" };
+    }
+    return { accountId: expenseAccounts[0].id, source: "first_available" };
+  }
+
+  // Tier 8: env fallback
   if (config.odooDefaults.defaultExpenseAccountId > 0) {
     return { accountId: config.odooDefaults.defaultExpenseAccountId, source: "env_fallback" };
   }
@@ -1016,38 +1048,69 @@ function fixExtractedAmounts(extracted, ocrText, logger) {
   const totals = extracted?.totals;
   if (!totals) return;
   const grandTotal = Number(totals.grand_total || 0);
-  if (!grandTotal) return;
+  const lineItems = extracted?.line_items || [];
 
-  const ocrAmounts = extractOcrAmounts(ocrText);
-  if (!ocrAmounts.length) return;
+  let correctTotal = 0;
 
-  const maxOcr = Math.max(...ocrAmounts);
-  if (maxOcr <= grandTotal * 1.5) return;
-
-  const ratio = maxOcr / grandTotal;
-  if (ratio >= 5 && ratio <= 15) {
-    const nearMax = ocrAmounts.filter((a) => Math.abs(a - maxOcr) / maxOcr < 0.02);
-    if (nearMax.length >= 1) {
-      if (logger) logger.info("Amount correction: Gemini total appears truncated.", {
-        geminiTotal: grandTotal, ocrMax: maxOcr, ratio: ratio.toFixed(1), nearMatches: nearMax.length
+  const lineSum = lineItems.reduce((s, li) => s + Number(li.amount || 0), 0);
+  if (lineItems.length >= 1 && lineSum >= 100) {
+    const ratio = lineSum / (grandTotal || 1);
+    if (ratio >= 5 && ratio <= 15) {
+      correctTotal = lineSum;
+      if (logger) logger.info("Amount correction: line item sum >> grand total, using line sum.", {
+        geminiTotal: grandTotal, lineSum, ratio: ratio.toFixed(1)
       });
-      totals.grand_total = maxOcr;
-      totals.grand_total_confidence = Math.min(totals.grand_total_confidence || 0.5, 0.7);
-      if (totals.net_total && totals.net_total < maxOcr) {
-        totals.net_total = maxOcr;
+    }
+  }
+
+  // Use amount_candidates when Gemini picked a much smaller total (e.g. 1045 vs 10505)
+  if (!correctTotal && grandTotal >= 1) {
+    const candidates = extracted?.amount_candidates || [];
+    const inRange = candidates
+      .map((c) => ({ amount: Number(c.amount || 0), confidence: Number(c.confidence || 0), label: c.label }))
+      .filter((c) => c.amount >= 1);
+    for (const c of inRange) {
+      const ratio = c.amount / grandTotal;
+      if (ratio >= 5 && ratio <= 15) {
+        correctTotal = c.amount;
+        if (logger) logger.info("Amount correction: using amount_candidate (OCR closer than Gemini total).", {
+          geminiTotal: grandTotal, candidateAmount: c.amount, label: c.label, ratio: ratio.toFixed(1)
+        });
+        break;
       }
-      const lineItems = extracted?.line_items || [];
-      if (lineItems.length === 1) {
-        const li = lineItems[0];
-        const liAmount = Number(li.amount || 0);
-        if (liAmount && liAmount < maxOcr && maxOcr / liAmount >= 5) {
-          li.amount = maxOcr;
-          if (li.quantity === 1 || !li.quantity) {
-            li.unit_price = maxOcr;
-          } else if (li.quantity > 0) {
-            li.unit_price = Math.round((maxOcr / li.quantity) * 100) / 100;
+    }
+  }
+
+  if (!correctTotal) {
+    const ocrAmounts = extractOcrAmounts(ocrText);
+    if (ocrAmounts.length) {
+      const maxOcr = Math.max(...ocrAmounts);
+      if (maxOcr > grandTotal * 1.5) {
+        const ratio = maxOcr / grandTotal;
+        if (ratio >= 5 && ratio <= 15) {
+          const nearMax = ocrAmounts.filter((a) => Math.abs(a - maxOcr) / maxOcr < 0.02);
+          if (nearMax.length >= 1) {
+            correctTotal = maxOcr;
+            if (logger) logger.info("Amount correction: Gemini total appears truncated (from OCR).", {
+              geminiTotal: grandTotal, ocrMax: maxOcr, ratio: ratio.toFixed(1)
+            });
           }
         }
+      }
+    }
+  }
+
+  if (correctTotal > 0) {
+    totals.grand_total = correctTotal;
+    totals.grand_total_confidence = Math.min(totals.grand_total_confidence || 0.5, 0.7);
+    if (totals.net_total && totals.net_total < correctTotal) totals.net_total = correctTotal;
+    if (lineItems.length === 1) {
+      const li = lineItems[0];
+      const liAmount = Number(li.amount || 0);
+      if (liAmount < correctTotal && correctTotal / (liAmount || 1) >= 5) {
+        li.amount = correctTotal;
+        const qty = Number(li.quantity) || 1;
+        li.unit_price = qty > 0 ? Math.round((correctTotal / qty) * 100) / 100 : correctTotal;
       }
     }
   }
@@ -1055,6 +1118,7 @@ function fixExtractedAmounts(extracted, ocrText, logger) {
 
 const VENDOR_NAME_ACCOUNT_KEYWORDS = {
   fabric: ["supplies", "raw materials", "inventory", "cost of sales", "cost of goods"],
+  "fabric trading": ["supplies", "raw materials", "inventory", "cost of sales", "cost of goods"],
   textile: ["supplies", "raw materials", "inventory", "cost of sales"],
   cloth: ["supplies", "raw materials", "inventory"],
   hardware: ["supplies", "repairs", "maintenance", "hardware"],
@@ -1106,9 +1170,8 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
   const taxPriceInclude = !!taxMeta?.priceInclude;
   const taxRate = Number(taxMeta?.amount || 12);
 
-  const total = (hasTax && globalVatInclusive && !taxPriceInclude && netTotal > 0)
-    ? netTotal
-    : (grandTotal || netTotal || 0);
+  const usedNetTotal = hasTax && globalVatInclusive && !taxPriceInclude && netTotal > 0;
+  const total = usedNetTotal ? netTotal : (grandTotal || netTotal || 0);
   const invoiceDate = String(inv.date || "").slice(0, 10) || undefined;
   const ref = String(inv.number || "").trim();
 
@@ -1133,7 +1196,8 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
       invoiceLines.push([0, 0, line]);
     }
   } else {
-    const adjustedTotal = hasTax ? adjustPriceForTax(total, globalVatInclusive, taxPriceInclude, taxRate) : total;
+    const singleLineVatInclusive = usedNetTotal ? false : globalVatInclusive;
+    const adjustedTotal = hasTax ? adjustPriceForTax(total, singleLineVatInclusive, taxPriceInclude, taxRate) : total;
     const line = {
       name: String(hint.suggested_account_name || "OCR Vendor Bill").slice(0, 256),
       quantity: 1,
@@ -1265,7 +1329,8 @@ async function processOneDocument(args) {
     doc,
     vatIds,
     purchaseJournalId,
-    industry
+    industry,
+    reprocess = false
   } = args;
   const attachmentId = m2oId(doc.attachment_id);
   if (!attachmentId) return { status: "skip", reason: "no_attachment" };
@@ -1273,7 +1338,15 @@ async function processOneDocument(args) {
   const att = await loadAttachment(odoo, companyId, attachmentId);
   if (!att) return { status: "skip", reason: "attachment_not_found" };
 
-  if (isProcessed(att.description, config.scan.processedMarkerPrefix, targetKey, doc.id)) {
+  if (reprocess && isProcessed(att.description, config.scan.processedMarkerPrefix, targetKey, doc.id)) {
+    const billId = getProcessedBillId(att.description, config.scan.processedMarkerPrefix, targetKey, doc.id);
+    const marker = makeProcessedMarker(config.scan.processedMarkerPrefix, targetKey, doc.id, billId || 0, doc.name);
+    const cleaned = String(att.description || "").replace(marker, "").replace(/\n{2,}/g, "\n").trim();
+    await odoo.write("ir.attachment", [att.id], { description: cleaned });
+    att.description = cleaned;
+    logger.info("Reprocess requested: cleared processed marker.", { docId: doc.id });
+  }
+  if (!reprocess && isProcessed(att.description, config.scan.processedMarkerPrefix, targetKey, doc.id)) {
     const billId = getProcessedBillId(att.description, config.scan.processedMarkerPrefix, targetKey, doc.id);
     if (billId) {
       const billExists = await odoo.searchRead(
@@ -1361,19 +1434,21 @@ async function processOneDocument(args) {
     }
   }
 
-  const duplicate = await findDuplicateBill(odoo, companyId, vendor.id, extracted);
-  if (duplicate?.id) {
-    const marker = makeProcessedMarker(
-      config.scan.processedMarkerPrefix,
-      targetKey,
-      doc.id,
-      duplicate.id,
-      doc.name
-    );
-    await odoo.write("ir.attachment", [att.id], {
-      description: appendMarker(att.description, marker)
-    });
-    return { status: "skip", reason: "duplicate", billId: duplicate.id };
+  if (!reprocess) {
+    const duplicate = await findDuplicateBill(odoo, companyId, vendor.id, extracted);
+    if (duplicate?.id) {
+      const marker = makeProcessedMarker(
+        config.scan.processedMarkerPrefix,
+        targetKey,
+        doc.id,
+        duplicate.id,
+        doc.name
+      );
+      await odoo.write("ir.attachment", [att.id], {
+        description: appendMarker(att.description, marker)
+      });
+      return { status: "skip", reason: "duplicate", billId: duplicate.id };
+    }
   }
 
   const currencyCode = String(extracted?.invoice?.currency || "").trim();
@@ -1423,6 +1498,7 @@ async function processOneDocument(args) {
 
   const lineCount = useLines ? lineItems.length : 1;
   const lineAccountIds = [];
+  const lineAccountSources = [];
   for (let i = 0; i < lineCount; i++) {
     const item = useLines ? lineItems[i] : null;
     const category = item?.expense_category || hint.category || "other";
@@ -1438,13 +1514,15 @@ async function processOneDocument(args) {
       alternatives: []
     } : null);
 
+    const vendorNameForHint = String(extracted?.vendor_details?.trade_name || extracted?.vendor?.name || vendor.name || "").trim();
     const resolved = await resolveExpenseAccountId({
       odoo, companyId, vendorId: vendor.id,
       category, suggestedName, geminiPick,
       expenseAccounts, accountMapping, targetDb: odoo.db,
-      lineDescription: lineDesc, vendorName: vendor.name
+      lineDescription: lineDesc, vendorName: vendorNameForHint || vendor.name
     });
     lineAccountIds.push(resolved.accountId);
+    lineAccountSources.push(resolved.source);
     logger.info("Account resolved.", {
       docId: doc.id, line: i, category, lineDesc: lineDesc.slice(0, 40),
       accountId: resolved.accountId, source: resolved.source
@@ -1479,7 +1557,7 @@ async function processOneDocument(args) {
     companyId,
     "documents.document",
     doc.id,
-    `✅ Draft Vendor Bill created: account.move #${billId}\nVendor=${vendor.name || "(unknown)"}`
+    `✅ Draft Vendor Bill created: account.move #${billId}<br/>Vendor=${vendor.name || "(unknown)"}`
   );
 
   {
@@ -1492,7 +1570,7 @@ async function processOneDocument(args) {
     const tn = String(vd.trade_name || vendor.tradeName || "").trim();
     const pn = String(vd.proprietor_name || vendor.proprietorName || "").trim();
     const vendorMsg = [
-      `🔍 <b>Vendor extraction</b>`,
+      `<b>🔍 Vendor extraction</b>`,
       `Name: ${vendor.name || "(unknown)"} | Confidence: ${Number(extracted?.vendor?.confidence || 0).toFixed(2)}`,
       `Entity type: <b>${entityLabel}</b>`,
       tn && tn.toLowerCase() !== (vendor.name || "").toLowerCase() ? `Trade name: ${tn}` : null,
@@ -1511,16 +1589,18 @@ async function processOneDocument(args) {
       const acct = acctId ? expenseAccounts.find((a) => a.id === acctId) : null;
       const li = useLines && lineItems[i] ? lineItems[i] : null;
       const desc = li ? String(li.description || "").slice(0, 60) : "Single line";
-      lines.push(`Line ${i + 1}: ${desc} → ${acct ? `${acct.code} ${acct.name}` : `(account #${acctId || "default"})`}`);
+      const resolvedSource = lineAccountSources[i] || "";
+      const srcLabel = resolvedSource ? ` <i>(${resolvedSource})</i>` : "";
+      lines.push(`Line ${i + 1}: ${desc} → ${acct ? `<b>${acct.code} ${acct.name}</b>${srcLabel}` : `(account #${acctId || "default"})`}`);
     }
-    const acctMsg = [`💡 <b>Account suggestions</b>`, ...lines].join("<br/>");
+    const acctMsg = [`<b>💡 Account suggestions</b>`, ...lines].join("<br/>");
     await safeMessagePost(odoo, companyId, "account.move", Number(billId), acctMsg);
   }
 
   {
     const t = extracted?.totals || {};
     const amtMsg = [
-      `📊 <b>Extracted amounts</b>`,
+      `<b>📊 Extracted amounts</b>`,
       `Grand total: ${Number(t.grand_total || 0).toFixed(2)} | Net total: ${Number(t.net_total || 0).toFixed(2)} | Tax: ${Number(t.tax_total || 0).toFixed(2)}`,
       `VAT-inclusive prices: ${t.amounts_are_vat_inclusive ? "Yes" : "No"} | Currency: ${extracted?.invoice?.currency || "(not detected)"}`,
       extracted?.invoice?.number ? `Invoice #: ${extracted.invoice.number}` : null,
@@ -1535,7 +1615,7 @@ async function processOneDocument(args) {
       companyId,
       "account.move",
       Number(billId),
-      `⚠️ Manual review recommended.\nVendor confidence=${Number(extracted?.vendor?.confidence || 0)}\nWarnings:\n- ${(extracted?.warnings || []).join("\n- ") || "(none)"}`
+      `<b>⚠️ Manual review recommended.</b> Vendor confidence=${Number(extracted?.vendor?.confidence || 0).toFixed(2)}<br/>Warnings:<br/>- ${(extracted?.warnings || []).join("<br/>- ") || "(none)"}`
     );
   }
   return { status: "ok", billId: Number(billId), vendorId: vendor.id, vendorCreated: !!vendor.created };
@@ -1703,7 +1783,8 @@ async function runOne({ logger, payload = {} }) {
     doc,
     vatIds: target.vatIds,
     purchaseJournalId: target.purchaseJournalId,
-    industry: target.industry
+    industry: target.industry,
+    reprocess: !!(payload.reprocess || payload.force_reprocess)
   });
 
   return {

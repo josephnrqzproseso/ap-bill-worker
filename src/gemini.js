@@ -1,3 +1,4 @@
+// @ts-nocheck
 const { safeJsonParse, sleep } = require("./utils");
 
 const RETRYABLE_STATUS = new Set([429, 500, 503]);
@@ -399,9 +400,11 @@ async function assignAccountsWithGemini(extracted, expenseAccounts, config, indu
     ? `\nORIGINAL OCR TEXT (use for additional context about what was purchased):\n${String(ocrText).slice(0, 3000)}\n`
     : "";
 
-  const prompt = `You are a senior accountant. Match each invoice line item to the BEST expense account from the chart of accounts.
+  const prompt = `You are a SENIOR FILIPINO ACCOUNTANT recording a vendor bill (Purchase/AP) in Odoo for a Philippine company. You must assign each invoice line to an account from the chart of accounts below.
 
-AVAILABLE EXPENSE ACCOUNTS:
+YOU MUST SELECT FROM THIS LIST. These are the ONLY valid accounts. Copy the account_id, account_code, and account_name EXACTLY from this list.
+
+AVAILABLE ACCOUNTS (id: [code] name):
 ${accountList}
 
 LINE ITEMS TO CLASSIFY:
@@ -410,63 +413,52 @@ ${lineDesc}
 Bill-level category hint: ${hint.category || "other"}
 Bill-level suggested account name: ${hint.suggested_account_name || "(none)"}
 Vendor name: ${extracted?.vendor?.name || "(unknown)"}
+Vendor trade name: ${extracted?.vendor_details?.trade_name || "(same)"}
 Vendor entity type: ${extracted?.vendor_details?.entity_type || "unknown"}
 ${industrySection}${ocrSection}
-RULES (CRITICAL - follow strictly):
+RULES (MANDATORY - follow ALL):
 
-1. SPECIFICITY IS KING: Always pick the MOST SPECIFIC matching account. NEVER pick generic/catch-all accounts like "Admin Expense", "Administrative Expense", "Miscellaneous Expense", "General Expense", "Other Expense", or "Sundry Expense" unless absolutely NO specific account matches.
+1. YOU MUST PICK AN ACCOUNT. Returning an account_id of 0 or an ID not in the list above is NOT allowed. Always select the closest match from the available accounts.
 
-2. BANNED ACCOUNTS - DO NOT USE THESE unless literally zero other accounts could work:
-   - Any account whose name contains: "Admin", "Administrative", "Miscellaneous", "General Expense", "Other Expense", "Sundry"
-   - Any account with code starting with "620" that is a generic catch-all
-   - If you MUST use one of these, set confidence below 0.3 and explain why no specific account fits in reasoning.
+2. THINK LIKE A PH ACCOUNTANT recording a vendor bill:
+   - What did we buy? What account do we debit?
+   - A laundry shop vendor → we paid for laundry services → "Outside Services", "Janitorial & Cleaning", "Laundry Expense", or similar
+   - A fabric/textile vendor → we bought materials → "Supplies", "Raw Materials", "Cost of Sales", or "Inventory" accounts
+   - A gas station → fuel → "Fuel & Oil", "Gas & Oil", "Transportation"
+   - A hardware store → supplies/materials → "Supplies", "Repairs & Maintenance"
+   - A food/restaurant vendor → "Meals & Entertainment", "Representation"
+   - Printing/stationery → "Office Supplies", "Printing & Stationery"
+   - Electricity/water/internet → "Utilities"
+   - Beer/beverages vendor → "Inventory" (asset_current) if for resale, "Meals & Entertainment" if for consumption
 
-3. MATCH BY ITEM DESCRIPTION FIRST, THEN USE VENDOR NAME AS CONTEXT:
-   - Match based on WHAT was purchased.
-   - If the item description is unclear, a brand name, or gibberish (bad OCR), USE THE VENDOR NAME to determine the account:
-     - Vendor "FABRIC TRADING" / "TEXTILE" → Supplies / Raw Materials / Cost of Sales
-     - Vendor "HARDWARE" → Supplies / Repairs & Maintenance
-     - Vendor "GAS STATION" / "FUEL" → Fuel & Oil
-     - Vendor "LUMBER" / "CONSTRUCTION" → Raw Materials / Supplies
-   - "TABLE CLOTH" from any vendor → Supplies / Housekeeping Supplies / Office Supplies
-   - "LPG REFILL 11KG" → Fuel & Oil / Gas & Oil / Fuel Expense
-   - "BOND PAPER A4" → Office Supplies / Stationery
-   - "TONER CARTRIDGE" → Office Supplies / Printing Supplies
-   - "ELECTRICITY BILL" → Utilities / Power & Light
-   - "WATER BILL" → Utilities / Water
-   - "INTERNET" → Communication / Telecommunications
-   - "JANITORIAL SUPPLIES" → Janitorial / Cleaning Supplies
-   - "FOOD / MEALS / CATERING" → Meals & Entertainment / Representation
-   - "LEGAL FEES / AUDIT FEES" → Professional Fees
-   - "SHIPPING / DELIVERY" → Freight / Shipping & Delivery
-   - "RENT / LEASE" → Rent Expense / Lease
-   - "INSURANCE" → Insurance Expense
-   - "REPAIRS / MAINTENANCE" → Repairs & Maintenance
-   - "GASOLINE / DIESEL / FUEL" → Fuel & Oil / Transportation
-   - "COURIER / GRAB / LALAMOVE" → Freight / Delivery / Transportation
-   - "PACKAGING / BOXES / TAPE" → Packaging Supplies (or Cost of Sales if for product)
-   - "FABRIC / CLOTH / THREAD" → Raw Materials / Supplies (or Cost of Sales for manufacturers)
-   - "CLEANING / DETERGENT / BLEACH" → Janitorial Supplies (or Cost of Revenue for laundry/cleaning business)
-   - "UNIFORM / WORKWEAR" → Uniforms / Employee Benefits
+3. VENDOR NAME IS YOUR STRONGEST CLUE when the item description is unclear (bad OCR, handwritten, brand name gibberish). A "LAUNDRY SHOP" sells laundry services. A "FABRIC TRADING" sells fabric. A "MARKETING CORPORATION" selling beer is a beer distributor.
 
-4. COST OF REVENUE vs OPERATING EXPENSE:
-   - If the item is directly consumed to produce/deliver the company's main product or service → prefer Cost of Sales / COGS / Cost of Revenue accounts.
-   - If the item is for office/admin/back-office operations → prefer Operating Expense accounts.
-   - When in doubt and no industry context, treat as Operating Expense.
+4. BANNED GENERIC ACCOUNTS - Do NOT use these if ANY specific account exists:
+   - "Admin Expense", "Administrative Expense", "Miscellaneous", "General Expense", "Other Expense", "Sundry"
+   - Only use generic accounts if the available list literally has NO account that relates to the purchase.
+   - If you must use a generic account, confidence must be below 0.3.
 
-5. CONFIDENCE SCORING:
-   - 0.9-1.0: Account name directly matches item (e.g. "Fuel & Oil" for "DIESEL")
-   - 0.7-0.9: Account is clearly the right category (e.g. "Office Supplies" for "BOND PAPER")
-   - 0.5-0.7: Reasonable guess, multiple accounts could fit
-   - 0.3-0.5: Generic fallback used because nothing specific matches
-   - Below 0.3: Wild guess
+5. PREFER SPECIFIC OVER GENERIC - even if the match isn't perfect:
+   - "Janitorial & Cleaning" is better than "Admin Expense" for a laundry vendor
+   - "Supplies" is better than "Admin Expense" for a hardware vendor  
+   - "Cost of Sales" or any inventory/COGS account is better than "Admin Expense" for goods purchased for resale
+   - An imperfect specific match (confidence 0.5) is ALWAYS better than a generic account
 
-6. For EACH assignment you MUST also return:
-   - account_code: the code of your chosen account (copy exactly from the list)
-   - account_name: the name of your chosen account (copy exactly from the list)
-   - alternatives: your 2nd and 3rd best choices with their account_id, account_code, account_name, and confidence
+6. COST OF REVENUE vs OPERATING EXPENSE (PH context):
+   - Items directly used to produce/deliver the company's product/service → Cost of Sales / COGS / Cost of Revenue
+   - Back-office/admin items → Operating Expense
+   - When in doubt, pick Operating Expense but NEVER Admin/General Expense if a more specific account exists
 
-7. bill_level fields: Pick the single best account if only one account were used for the entire bill. Include bill_level_account_code and bill_level_account_name.`;
+7. COPY EXACTLY from the list above:
+   - account_id: the numeric ID (first number before the colon)
+   - account_code: the code in brackets [like this]
+   - account_name: the name after the brackets
+   Do NOT invent account names or codes. Copy them character-for-character.
+
+8. ALTERNATIVES: Always provide 2nd and 3rd best choices. These are critical fallbacks.
+
+9. BILL-LEVEL: Pick the single best account for the whole bill (bill_level_account_id/code/name).`;
+
 
   const body = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
