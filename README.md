@@ -44,6 +44,17 @@ Strongly recommended:
 - `STATE_BUCKET` (for cross-run cursor state)
 - `DEFAULT_EXPENSE_ACCOUNT_ID` (fallback account for invoice line)
 
+## Security
+
+**Never commit real credentials.** Use `.env` for local secrets (gitignored). `.env.example` contains placeholders only.
+
+**If an API key was exposed** (e.g. in a public repo):
+
+1. **Regenerate the Gemini API key** in [Google AI Studio](https://aistudio.google.com/apikey) or [GCP Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials).
+2. In Credentials, find the key → Edit → **Regenerate key**.
+3. Update your local `.env`, Cloud Run secrets, and any deployment scripts with the new key.
+4. Restrict the new key: Edit → Application restrictions (e.g. IP, referrer) and API restrictions (limit to Gemini/Vision APIs you use).
+
 ## Local run
 
 1. Install Node.js 20+.
@@ -107,10 +118,10 @@ This implementation ports the core behavior from your Apps Script:
 If you need strict one-to-one parity with every helper from the original script (for example vendor rules, deep tax heuristics, and exact account scoring), extend `src/worker.js` with those functions and keep the same naming to simplify verification.
 
 
-$baseUrl  = "https://proseso-accounting-test.odoo.com"
-$db       = "proseso-accounting-test"
-$login    = "joseph.proseso@gmail.com"
-$password = "Papaya3562!"
+$baseUrl  = "https://your-odoo-instance.odoo.com"
+$db       = "your-database"
+$login    = "your-email@example.com"
+$password = "your-odoo-password"
 
 $endpoint = "$baseUrl/jsonrpc"
 

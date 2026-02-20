@@ -81,23 +81,25 @@ const extractionSchema = {
     totals: {
       type: "object",
       properties: {
-        grand_total: { type: "number" },
+        grand_total: { type: "number", description: "Total amount due (final amount to pay, VAT-inclusive if applicable)" },
         grand_total_confidence: { type: "number" },
         tax_total: { type: "number" },
         tax_total_confidence: { type: "number" },
-        net_total: { type: "number" },
+        net_total: { type: "number", description: "Total BEFORE VAT (vatable base / net of tax). If invoice only shows a VAT-inclusive total, compute net_total = grand_total / 1.12 for vatable invoices" },
         net_total_confidence: { type: "number" },
         vat_exempt_amount: { type: "number" },
         vat_exempt_amount_confidence: { type: "number" },
         zero_rated_amount: { type: "number" },
-        zero_rated_amount_confidence: { type: "number" }
+        zero_rated_amount_confidence: { type: "number" },
+        amounts_are_vat_inclusive: { type: "boolean", description: "true if the grand_total and line item prices already include VAT (common in PH receipts/invoices)" }
       },
       required: [
         "grand_total", "grand_total_confidence",
         "tax_total", "tax_total_confidence",
         "net_total", "net_total_confidence",
         "vat_exempt_amount", "vat_exempt_amount_confidence",
-        "zero_rated_amount", "zero_rated_amount_confidence"
+        "zero_rated_amount", "zero_rated_amount_confidence",
+        "amounts_are_vat_inclusive"
       ]
     },
     amount_candidates: {
@@ -121,9 +123,10 @@ const extractionSchema = {
           description: { type: "string" },
           quantity: { type: "number" },
           unit_price: { type: "number" },
-          amount: { type: "number" }
+          amount: { type: "number" },
+          unit_price_includes_vat: { type: "boolean", description: "true if the unit_price shown on the invoice already includes VAT" }
         },
-        required: ["description", "quantity", "unit_price", "amount"]
+        required: ["description", "quantity", "unit_price", "amount", "unit_price_includes_vat"]
       }
     },
     warnings: { type: "array", items: { type: "string" } }
@@ -187,6 +190,15 @@ PH VAT RULES (IMPORTANT):
 
 Also copy exempt/zero-rated amounts into:
 - totals.vat_exempt_amount, totals.zero_rated_amount (if known).
+
+VAT-INCLUSIVE PRICE DETECTION (CRITICAL):
+- Most PH receipts/invoices show prices that ALREADY INCLUDE 12% VAT.
+- Set totals.amounts_are_vat_inclusive = true if the line item prices and grand_total include VAT.
+  - Indicators: "Total Sales (VAT Inclusive)", or the grand total equals vatable_base + vat_amount, or line prices × qty = grand total and a separate VAT amount is shown.
+  - If the invoice shows a separate "Vatable Sales" (net) amount and a "VAT Amount", the unit prices are typically VAT-inclusive.
+- Set line_items[].unit_price_includes_vat = true for each line where the unit price includes VAT.
+- totals.net_total should ALWAYS be the VAT-exclusive amount (before tax). If only a VAT-inclusive total is shown, compute: net_total = grand_total / 1.12 for vatable invoices.
+- totals.grand_total should be the final amount due (what the buyer actually pays).
 
 OCR TEXT:
 ${ocrText || "(no OCR text available)"}

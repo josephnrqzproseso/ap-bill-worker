@@ -63,18 +63,36 @@ async function loadRoutingSheetData(config) {
   return { headers, rows };
 }
 
+function indexToColLetter(idx) {
+  let result = "";
+  let n = idx;
+  do {
+    result = String.fromCharCode(65 + (n % 26)) + result;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return result;
+}
+
 async function saveRoutingSheetData(config, headers, rows) {
-  const sheets = await getSheetsClient();
-  const values = [
-    headers,
-    ...rows.map((row) => headers.map((h) => (row[h] ?? "")))
+  const vatCols = [
+    "vat_purchase_tax_id_goods", "vat_purchase_tax_id_services", "vat_purchase_tax_id_generic",
+    "purchase_journal_id", "ap_folder_id"
   ];
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: config.routing.spreadsheetId,
-    range: `${config.routing.routingSheetName}!A1`,
-    valueInputOption: "RAW",
-    requestBody: { values }
-  });
+  const sheets = await getSheetsClient();
+  const baseRange = config.routing.routingSheetName;
+  for (const col of vatCols) {
+    const idx = headers.indexOf(col);
+    if (idx < 0) continue;
+    const colLetter = indexToColLetter(idx);
+    const range = `${baseRange}!${colLetter}1:${colLetter}${rows.length + 1}`;
+    const values = [[col], ...rows.map((row) => [row[col] ?? ""])];
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: config.routing.spreadsheetId,
+      range,
+      valueInputOption: "RAW",
+      requestBody: { values }
+    });
+  }
 }
 
 async function loadRawRoutingRows(config) {

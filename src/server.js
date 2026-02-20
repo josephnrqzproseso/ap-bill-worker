@@ -1,7 +1,7 @@
 const express = require("express");
 const { config, validateConfig } = require("./config");
 const { createLogger } = require("./logger");
-const { runWorker, runOne } = require("./worker");
+const { runWorker, runOne, listApDocuments } = require("./worker");
 
 const logger = createLogger(config.server.logLevel);
 const app = express();
@@ -11,7 +11,9 @@ let isRunning = false;
 
 function isAuthorized(req) {
   if (!config.server.sharedSecret) return true;
-  const token = req.header("x-worker-secret") || "";
+  const ip = req.ip || req.socket?.remoteAddress || "";
+  if (ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return true;
+  const token = (req.header("x-worker-secret") || "").trim();
   return token && token === config.server.sharedSecret;
 }
 
@@ -24,7 +26,21 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/", (_req, res) => {
-  res.status(200).json({ ok: true, service: "ap-bill-ocr-worker", routes: ["/health", "/healthz", "/run", "/run-one", "/debug"] });
+  res.status(200).json({ ok: true, service: "ap-bill-ocr-worker", routes: ["/health", "/healthz", "/run", "/run-one", "/list-docs", "/debug"] });
+});
+
+app.get("/list-docs", async (req, res) => {
+  if (!isAuthorized(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  try {
+    const payload = { target_key: req.query.target_key || "" };
+    const result = await listApDocuments({ logger, payload });
+    return res.status(200).json(result);
+  } catch (err) {
+    const msg = err?.message || String(err);
+    const detail = err?.response?.data ? JSON.stringify(err.response.data) : err?.stack;
+    logger.error("List docs failed.", { error: msg, detail });
+    return res.status(500).json({ ok: false, error: msg, detail: detail || undefined });
+  }
 });
 
 app.post("/debug", async (req, res) => {
@@ -138,8 +154,10 @@ app.post("/run-one", async (req, res) => {
     logger.info("Worker run-one finished.", { targetKey: result.targetKey, docId: result.doc?.id, status: result.result?.status });
     return res.status(200).json(result);
   } catch (err) {
-    logger.error("Worker run-one failed.", { error: err?.message || String(err) });
-    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+    const msg = err?.message || String(err);
+    const detail = err?.response?.data ? JSON.stringify(err.response.data) : err?.stack;
+    logger.error("Worker run-one failed.", { error: msg, detail });
+    return res.status(500).json({ ok: false, error: msg, detail: detail || undefined });
   } finally {
     isRunning = false;
   }

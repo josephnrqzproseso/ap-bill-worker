@@ -115,11 +115,13 @@ function isEnabledRow(row) {
   return x === "true" || x === "1" || x === "yes" || x === "y";
 }
 
-function ensureVatColumns(headers, rows) {
+function ensureAutoColumns(headers, rows) {
   const wanted = [
     "vat_purchase_tax_id_goods",
     "vat_purchase_tax_id_services",
-    "vat_purchase_tax_id_generic"
+    "vat_purchase_tax_id_generic",
+    "purchase_journal_id",
+    "ap_folder_id"
   ];
   let changed = false;
   for (const c of wanted) {
@@ -240,32 +242,57 @@ async function pickVatTaxesForCompany(odoo, companyId) {
   };
 }
 
-async function refreshRoutingVatTaxIds(headers, rows, logger) {
-  ensureVatColumns(headers, rows);
+async function resolvePurchaseJournalId(odoo, companyId) {
+  const journals = await odoo.searchRead(
+    "account.journal",
+    [["type", "=", "purchase"], ["company_id", "=", companyId]],
+    ["id"],
+    kwWithCompany(companyId, { limit: 1, order: "id asc" })
+  );
+  return journals?.[0]?.id ? Number(journals[0].id) : 0;
+}
+
+async function refreshRoutingAutoFields(headers, rows, logger) {
+  ensureAutoColumns(headers, rows);
   const groups = groupRowsByTarget(rows);
   let updated = 0;
   for (const [key, g] of groups.entries()) {
     try {
       const odoo = new OdooClient(g.cfg);
       const pick = await pickVatTaxesForCompany(odoo, g.companyId);
+
+      let journalId = 0;
+      try { journalId = await resolvePurchaseJournalId(odoo, g.companyId); } catch (_) {}
+
+      let apFolderId = 0;
+      try { apFolderId = await resolveApFolderId(odoo, g.companyId); } catch (_) {}
+
       for (const row of g.rows) {
         const before = [
           String(row.vat_purchase_tax_id_goods || "").trim(),
           String(row.vat_purchase_tax_id_services || "").trim(),
-          String(row.vat_purchase_tax_id_generic || "").trim()
+          String(row.vat_purchase_tax_id_generic || "").trim(),
+          String(row.purchase_journal_id || "").trim(),
+          String(row.ap_folder_id || "").trim()
         ].join("|");
+
         row.vat_purchase_tax_id_goods = pick.goodsId ? String(pick.goodsId) : "";
         row.vat_purchase_tax_id_services = pick.servicesId ? String(pick.servicesId) : "";
         row.vat_purchase_tax_id_generic = pick.genericId ? String(pick.genericId) : "";
+        if (journalId && !Number(row.purchase_journal_id)) row.purchase_journal_id = String(journalId);
+        if (apFolderId && !Number(row.ap_folder_id)) row.ap_folder_id = String(apFolderId);
+
         const after = [
           String(row.vat_purchase_tax_id_goods || "").trim(),
           String(row.vat_purchase_tax_id_services || "").trim(),
-          String(row.vat_purchase_tax_id_generic || "").trim()
+          String(row.vat_purchase_tax_id_generic || "").trim(),
+          String(row.purchase_journal_id || "").trim(),
+          String(row.ap_folder_id || "").trim()
         ].join("|");
         if (after !== before) updated += 1;
       }
     } catch (err) {
-      logger.warn("VAT refresh failed for routing group.", { key, error: err?.message || String(err) });
+      logger.warn("Auto-field refresh failed for routing group.", { key, error: err?.message || String(err) });
     }
   }
   return { updated, groupCount: groups.size };
@@ -285,9 +312,9 @@ async function getRoutingRows(logger) {
     }
   }
 
-  const vatRes = await refreshRoutingVatTaxIds(headers, rows, logger);
+  const refreshRes = await refreshRoutingAutoFields(headers, rows, logger);
   await saveRoutingSheetData(config, headers, rows);
-  logger.info("Refreshed VAT tax IDs into ProjectRouting.", vatRes);
+  logger.info("Refreshed auto-fields into ProjectRouting.", refreshRes);
 
   return rows.map(toRoutingRowStrict).filter(Boolean);
 }
@@ -534,9 +561,32 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
   return { status: "created", partnerId: Number(newId), created: true, name };
 }
 
-function pickTaxIds(vatIds) {
-  const all = [vatIds.goods, vatIds.services, vatIds.generic].map((v) => Number(v) || 0).filter(Boolean);
-  return [...new Set(all)];
+function pickTaxIds(vatIds, extracted) {
+  const classification = String(extracted?.vat?.classification || "").toLowerCase();
+  if (classification === "exempt" || classification === "zero_rated" || classification === "unknown") {
+    return [];
+  }
+  const gs = String(extracted?.vat?.goods_or_services || "").toLowerCase();
+  if (gs === "services" && Number(vatIds.services)) return [Number(vatIds.services)];
+  if (gs === "goods" && Number(vatIds.goods)) return [Number(vatIds.goods)];
+  const generic = Number(vatIds.generic) || 0;
+  return generic ? [generic] : [];
+}
+
+async function getTaxMeta(odoo, companyId, taxIds) {
+  if (!taxIds.length) return null;
+  const rows = await odoo.searchRead(
+    "account.tax",
+    [["id", "in", taxIds]],
+    ["id", "amount", "price_include"],
+    kwWithCompany(companyId, { limit: 10 })
+  );
+  if (!rows.length) return null;
+  const tax = rows[0];
+  return {
+    priceInclude: !!tax.price_include,
+    amount: Number(tax.amount || 0)
+  };
 }
 
 async function findDuplicateBill(odoo, companyId, vendorId, extracted) {
@@ -560,12 +610,43 @@ async function findDuplicateBill(odoo, companyId, vendorId, extracted) {
   );
 }
 
-function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId) {
+async function resolveCurrencyId(odoo, companyId, currencyCode) {
+  if (!currencyCode) return null;
+  const code = currencyCode.toUpperCase().trim();
+  if (!code || code === "PHP") return null;
+  const rows = await odoo.searchRead(
+    "res.currency",
+    [["name", "=", code], ["active", "=", true]],
+    ["id"],
+    kwWithCompany(companyId, { limit: 1 })
+  );
+  return rows?.[0]?.id ? Number(rows[0].id) : null;
+}
+
+function adjustPriceForTax(price, invoiceVatInclusive, taxPriceInclude, taxRate) {
+  if (!price) return price;
+  if (invoiceVatInclusive && !taxPriceInclude) {
+    return Math.round((price / (1 + taxRate / 100)) * 100) / 100;
+  }
+  if (!invoiceVatInclusive && taxPriceInclude) {
+    return Math.round((price * (1 + taxRate / 100)) * 100) / 100;
+  }
+  return price;
+}
+
+function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId, currencyId, taxMeta) {
   const inv = extracted?.invoice || {};
   const totals = extracted?.totals || {};
   const grandTotal = Number(totals.grand_total || 0);
   const netTotal = Number(totals.net_total || 0);
-  const total = grandTotal || netTotal || 0;
+  const globalVatInclusive = !!totals.amounts_are_vat_inclusive;
+  const hasTax = taxIds.length > 0;
+  const taxPriceInclude = !!taxMeta?.priceInclude;
+  const taxRate = Number(taxMeta?.amount || 12);
+
+  const total = (hasTax && globalVatInclusive && !taxPriceInclude && netTotal > 0)
+    ? netTotal
+    : (grandTotal || netTotal || 0);
   const invoiceDate = String(inv.date || "").slice(0, 10) || undefined;
   const ref = String(inv.number || "").trim();
 
@@ -574,29 +655,32 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
 
   if (lineItems.length > 0) {
     for (const item of lineItems) {
+      const itemVatInclusive = item.unit_price_includes_vat ?? globalVatInclusive;
+      const rawPrice = Number(item.unit_price || item.amount || 0);
       const line = {
         name: String(item.description || "Line item").slice(0, 256),
         quantity: Number(item.quantity) || 1,
-        price_unit: Number(item.unit_price || item.amount || 0)
+        price_unit: hasTax ? adjustPriceForTax(rawPrice, itemVatInclusive, taxPriceInclude, taxRate) : rawPrice
       };
       if (config.odooDefaults.defaultExpenseAccountId > 0) {
         line.account_id = Number(config.odooDefaults.defaultExpenseAccountId);
       }
-      if (taxIds.length) {
+      if (hasTax) {
         line.tax_ids = [[6, 0, taxIds]];
       }
       invoiceLines.push([0, 0, line]);
     }
   } else {
+    const adjustedTotal = hasTax ? adjustPriceForTax(total, globalVatInclusive, taxPriceInclude, taxRate) : total;
     const line = {
       name: String(extracted?.expense_account_hint?.suggested_account_name || "OCR Vendor Bill").slice(0, 256),
       quantity: 1,
-      price_unit: total
+      price_unit: adjustedTotal
     };
     if (config.odooDefaults.defaultExpenseAccountId > 0) {
       line.account_id = Number(config.odooDefaults.defaultExpenseAccountId);
     }
-    if (taxIds.length) {
+    if (hasTax) {
       line.tax_ids = [[6, 0, taxIds]];
     }
     invoiceLines.push([0, 0, line]);
@@ -610,6 +694,7 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
   };
 
   if (purchaseJournalId) vals.journal_id = Number(purchaseJournalId);
+  if (currencyId) vals.currency_id = Number(currencyId);
   if (ref) vals.ref = ref;
   if (invoiceDate) vals.invoice_date = invoiceDate;
   return vals;
@@ -648,15 +733,55 @@ async function attachCopyToBill(odoo, companyId, att, billId, docId) {
   });
 }
 
-async function linkDocumentToBill(odoo, companyId, docId, billId) {
+async function linkDocumentToBill(odoo, companyId, docId, billId, logger) {
+  const docRows = await odoo.searchRead(
+    "documents.document",
+    [["id", "=", Number(docId)]],
+    ["id", "folder_id"],
+    kwWithCompany(companyId, { limit: 1 })
+  );
+  const originalFolderId = docRows?.[0]?.folder_id
+    ? (Array.isArray(docRows[0].folder_id) ? docRows[0].folder_id[0] : Number(docRows[0].folder_id))
+    : 0;
+
   const vals = {};
   if (await documentsDocumentHasField(odoo, "res_model")) vals.res_model = "account.move";
   if (await documentsDocumentHasField(odoo, "res_id")) vals.res_id = Number(billId);
   if (await documentsDocumentHasField(odoo, "account_move_id")) vals.account_move_id = Number(billId);
   if (await documentsDocumentHasField(odoo, "invoice_id")) vals.invoice_id = Number(billId);
+  if (originalFolderId) vals.folder_id = originalFolderId;
+
   if (Object.keys(vals).length) {
     await odoo.write("documents.document", [Number(docId)], vals);
   }
+
+  if (originalFolderId) {
+    try {
+      const afterWrite = await odoo.searchRead(
+        "documents.document",
+        [["id", "=", Number(docId)]],
+        ["id", "folder_id"],
+        kwWithCompany(companyId, { limit: 1 })
+      );
+      const newFolderId = afterWrite?.[0]?.folder_id
+        ? (Array.isArray(afterWrite[0].folder_id) ? afterWrite[0].folder_id[0] : Number(afterWrite[0].folder_id))
+        : 0;
+      if (newFolderId && newFolderId !== originalFolderId) {
+        await odoo.write("documents.document", [Number(docId)], { folder_id: originalFolderId });
+        if (logger) logger.info("Restored document folder after link.", { docId, originalFolderId, movedTo: newFolderId });
+      }
+    } catch (_) {}
+  }
+
+  const baseUrl = odoo.baseUrl || "";
+  const docLink = `${baseUrl}/odoo/documents/${docId}`;
+  await safeMessagePost(
+    odoo,
+    companyId,
+    "account.move",
+    Number(billId),
+    `📎 Source document: <a href="${docLink}">Document #${docId}</a> (Documents app)`
+  );
 }
 
 async function processOneDocument(args) {
@@ -677,7 +802,22 @@ async function processOneDocument(args) {
 
   if (isProcessed(att.description, config.scan.processedMarkerPrefix, targetKey, doc.id)) {
     const billId = getProcessedBillId(att.description, config.scan.processedMarkerPrefix, targetKey, doc.id);
-    return { status: "skip", reason: "already_processed", billId };
+    if (billId) {
+      const billExists = await odoo.searchRead(
+        "account.move",
+        [["id", "=", billId]],
+        ["id"],
+        kwWithCompany(companyId, { limit: 1 })
+      );
+      if (billExists?.length) {
+        return { status: "skip", reason: "already_processed", billId };
+      }
+      logger.info("Linked bill was deleted, clearing marker for reprocessing.", { docId: doc.id, billId });
+      const marker = makeProcessedMarker(config.scan.processedMarkerPrefix, targetKey, doc.id, billId, doc.name);
+      const cleaned = String(att.description || "").replace(marker, "").replace(/\n{2,}/g, "\n").trim();
+      await odoo.write("ir.attachment", [att.id], { description: cleaned });
+      att.description = cleaned;
+    }
   }
 
   let ocrText = "";
@@ -762,12 +902,18 @@ async function processOneDocument(args) {
     return { status: "skip", reason: "duplicate", billId: duplicate.id };
   }
 
+  const currencyCode = String(extracted?.invoice?.currency || "").trim();
+  const currencyId = await resolveCurrencyId(odoo, companyId, currencyCode);
+  const taxIds = pickTaxIds(vatIds, extracted);
+  const taxMeta = await getTaxMeta(odoo, companyId, taxIds);
   const billVals = buildBillVals(
     extracted,
     vendor.id,
     companyId,
-    pickTaxIds(vatIds),
-    purchaseJournalId
+    taxIds,
+    purchaseJournalId,
+    currencyId,
+    taxMeta
   );
   const billId = await odoo.create("account.move", billVals);
   const marker = makeProcessedMarker(
@@ -781,7 +927,7 @@ async function processOneDocument(args) {
     description: appendMarker(att.description, marker)
   });
   await attachCopyToBill(odoo, companyId, att, Number(billId), Number(doc.id));
-  await linkDocumentToBill(odoo, companyId, Number(doc.id), Number(billId));
+  await linkDocumentToBill(odoo, companyId, Number(doc.id), Number(billId), logger);
   await safeMessagePost(
     odoo,
     companyId,
@@ -934,6 +1080,52 @@ async function runOne({ logger, payload = {} }) {
   };
 }
 
+async function listApDocuments({ logger, payload = {} }) {
+  const routingRows = await getRoutingRows(logger);
+  const targets = groupRoutingRows(routingRows);
+  if (!targets.length) {
+    throw new Error("No enabled routing rows available.");
+  }
+
+  const targetKeyInput = String(payload.target_key || "").trim();
+  let target = null;
+  if (targetKeyInput) {
+    target = targets.find((t) => t.targetKey === targetKeyInput) || null;
+    if (!target) throw new Error(`target_key not found: ${targetKeyInput}`);
+  } else if (targets.length === 1) {
+    target = targets[0];
+  } else {
+    throw new Error("Multiple targets enabled. Pass target_key in request query or body.");
+  }
+
+  const odoo = new OdooClient(target.targetCfg);
+  let apFolderId = Number(target.apFolderId || 0);
+  if (!apFolderId) apFolderId = await resolveApFolderId(odoo, target.companyId);
+
+  const allDocs = await odoo.searchRead(
+    "documents.document",
+    [
+      ["folder_id", "=", apFolderId],
+      ["is_folder", "=", false],
+      ["attachment_id", "!=", false]
+    ],
+    ["id", "name", "attachment_id", "create_date"],
+    kwWithCompany(target.companyId, { limit: 5000, order: "id desc" })
+  );
+  return {
+    ok: true,
+    targetKey: target.targetKey,
+    apFolderId,
+    count: allDocs.length,
+    documents: allDocs.map((d) => ({
+      doc_id: Number(d.id),
+      name: String(d.name || ""),
+      attachment_id: m2oId(d.attachment_id),
+      create_date: d.create_date || null
+    }))
+  };
+}
+
 async function runWorker({ logger }) {
   const startMs = Date.now();
   const routingRows = await getRoutingRows(logger);
@@ -982,5 +1174,6 @@ async function runWorker({ logger }) {
 
 module.exports = {
   runWorker,
-  runOne
+  runOne,
+  listApDocuments
 };

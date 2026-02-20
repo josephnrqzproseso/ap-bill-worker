@@ -1,7 +1,9 @@
 const path = require("path");
 const dotenv = require("dotenv");
 
-dotenv.config({ path: path.resolve(process.cwd(), ".env") });
+// Load from project root (parent of src/), override any system env
+const projectRoot = path.resolve(__dirname, "..");
+dotenv.config({ path: path.join(projectRoot, ".env"), override: true });
 
 function toInt(value, fallback) {
   const n = Number.parseInt(String(value ?? ""), 10);

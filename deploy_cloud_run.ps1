@@ -10,17 +10,19 @@ param(
 
 $ProjectId = $ProjectId.Trim()
 $Region = $Region.Trim()
-$ServiceName = $ServiceName.Trim()
-$Image = $Image.Trim()
+if ($ServiceName) { $ServiceName = $ServiceName.Trim() }
+if (-not $ServiceName) { $ServiceName = "ap-bill-ocr-worker" }
+if ($Image) { $Image = $Image.Trim() } else { $Image = "" }
 
 if (-not $ProjectId) { throw "ProjectId is required." }
 if (-not $Region) { throw "Region is required." }
-if (-not $ServiceName -and -not $Image) {
+$imageName = $ServiceName
+if (-not $imageName -and -not $Image) {
   throw "ServiceName is empty. Pass -ServiceName or a full -Image."
 }
 
 if (-not $Image) {
-  $Image = "$Region-docker.pkg.dev/$ProjectId/ap-bill/$ServiceName:latest"
+  $Image = "$Region-docker.pkg.dev/$ProjectId/ap-bill/${imageName}:latest"
 }
 
 if ($Image -notmatch "^[a-z0-9\.\-]+\/[a-z0-9\.\-]+\/[a-z0-9\.\-_]+\/[a-z0-9\.\-_]+:[A-Za-z0-9_\.\-]+$") {

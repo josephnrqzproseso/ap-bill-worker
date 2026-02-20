@@ -2,6 +2,20 @@ const { getAccessToken } = require("./gcp-auth");
 const { uploadObject, listObjects, downloadText } = require("./gcs");
 const { sleep, safeJsonParse } = require("./utils");
 
+function visionHeaders(accessToken, includeJsonContentType = true) {
+  const headers = {
+    Authorization: `Bearer ${accessToken}`
+  };
+  if (includeJsonContentType) headers["Content-Type"] = "application/json";
+  const quotaProject =
+    process.env.GOOGLE_CLOUD_QUOTA_PROJECT ||
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.GCLOUD_PROJECT ||
+    "";
+  if (quotaProject) headers["x-goog-user-project"] = quotaProject;
+  return headers;
+}
+
 async function ocrImageViaVision(buffer, config) {
   const accessToken = await getAccessToken();
   const req = {
@@ -17,10 +31,7 @@ async function ocrImageViaVision(buffer, config) {
   const url = "https://vision.googleapis.com/v1/images:annotate";
   const first = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
+    headers: visionHeaders(accessToken, true),
     body: JSON.stringify(req)
   });
   const firstText = await first.text();
@@ -33,10 +44,7 @@ async function ocrImageViaVision(buffer, config) {
   req.requests[0].features = [{ type: "TEXT_DETECTION" }];
   const second = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
+    headers: visionHeaders(accessToken, true),
     body: JSON.stringify(req)
   });
   const secondText = await second.text();
@@ -76,10 +84,7 @@ async function startPdfOcrJob(pdfBuffer, config) {
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
+    headers: visionHeaders(accessToken, true),
     body: JSON.stringify(payload)
   });
   const text = await resp.text();
@@ -95,7 +100,7 @@ async function tryFinishPdfOcrJob(opName, outputBase, config) {
   const opUrl = `https://vision.googleapis.com/v1/${opPath}`;
   const opResp = await fetch(opUrl, {
     method: "GET",
-    headers: { Authorization: `Bearer ${accessToken}` }
+    headers: visionHeaders(accessToken, false)
   });
   const opText = await opResp.text();
   if (!opResp.ok) throw new Error(`Vision operation check failed: HTTP ${opResp.status} ${opText.slice(0, 600)}`);
