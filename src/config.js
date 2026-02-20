@@ -37,7 +37,8 @@ const config = {
     source: process.env.ROUTING_SOURCE || "sheets",
     spreadsheetId: process.env.SHEETS_SPREADSHEET_ID || "",
     routingSheetName: process.env.ROUTING_SHEET_NAME || "ProjectRouting",
-    vendorRulesSheetName: process.env.VENDOR_RULES_SHEET_NAME || "VendorRules"
+    vendorRulesSheetName: process.env.VENDOR_RULES_SHEET_NAME || "VendorRules",
+    accountMappingSheetName: process.env.ACCOUNT_MAPPING_SHEET_NAME || "AccountMapping"
   },
   scan: {
     docsBatchLimit: toInt(process.env.DOCS_BATCH_LIMIT, 50),
@@ -56,7 +57,8 @@ const config = {
   },
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || "",
-    model: process.env.GEMINI_MODEL || "gemini-2.5-pro"
+    model: process.env.GEMINI_MODEL || "gemini-3-pro-preview",
+    fallbackModel: process.env.GEMINI_FALLBACK_MODEL || "gemini-2.5-pro"
   },
   odooDefaults: {
     sourceBaseUrl: process.env.SOURCE_BASE_URL || "",

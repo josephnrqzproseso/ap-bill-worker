@@ -3,11 +3,12 @@ const { OdooClient, kwWithCompany } = require("./odoo");
 const {
   loadRoutingSheetData,
   saveRoutingSheetData,
-  toRoutingRowStrict
+  toRoutingRowStrict,
+  loadAccountMapping
 } = require("./sheets");
 const { ocrTextForAttachment } = require("./vision");
-const { extractInvoiceWithGemini } = require("./gemini");
-const { m2oId, normalizeOdooBaseUrl, deriveDbFromBaseUrl, isFalsyOdooValue } = require("./utils");
+const { extractInvoiceWithGemini, assignAccountsWithGemini } = require("./gemini");
+const { m2oId, normalizeOdooBaseUrl, deriveDbFromBaseUrl, isFalsyOdooValue, sleep } = require("./utils");
 const { loadState, saveState } = require("./state");
 const {
   makeProcessedMarker,
@@ -121,7 +122,8 @@ function ensureAutoColumns(headers, rows) {
     "vat_purchase_tax_id_services",
     "vat_purchase_tax_id_generic",
     "purchase_journal_id",
-    "ap_folder_id"
+    "ap_folder_id",
+    "industry"
   ];
   let changed = false;
   for (const c of wanted) {
@@ -210,11 +212,13 @@ async function pickVatTaxesForCompany(odoo, companyId) {
     return { goodsId: null, servicesId: null, genericId: null };
   }
 
-  const serviceLike = (t) => has(t, /service|consult|professional|repair|rent|labor|contract|freight/);
-  const goodsLike = (t) => has(t, /goods|supply|material|asset|capital|inventory|product|merch/);
+  const isCapitalGoods = (t) => has(t, /capital\s*goods|capital\s*asset|\bcapital\b.*\bgoods\b|\b12%\s*c\b|\b12%c\b/);
+  const serviceLike = (t) => has(t, /service|consult|professional|repair|rent|labor|contract|freight/) && !isCapitalGoods(t);
+  const goodsLike = (t) => has(t, /goods|supply|material|inventory|product|merch/) && !isCapitalGoods(t);
 
   const generic = pickTopTaxByScore(vat12, (t) => {
     let score = 0;
+    if (isCapitalGoods(t)) return -100;
     if (norm(t.type_tax_use) === "purchase") score += 5;
     if (!t.price_include) score += 2;
     if (serviceLike(t) || goodsLike(t)) score += 1;
@@ -222,6 +226,7 @@ async function pickVatTaxesForCompany(odoo, companyId) {
   });
   const services = pickTopTaxByScore(vat12, (t) => {
     let score = 0;
+    if (isCapitalGoods(t)) return -100;
     if (serviceLike(t)) score += 10;
     if (!goodsLike(t)) score += 2;
     if (!t.price_include) score += 1;
@@ -229,6 +234,7 @@ async function pickVatTaxesForCompany(odoo, companyId) {
   });
   const goods = pickTopTaxByScore(vat12, (t) => {
     let score = 0;
+    if (isCapitalGoods(t)) return -100;
     if (goodsLike(t)) score += 10;
     if (!serviceLike(t)) score += 2;
     if (!t.price_include) score += 1;
@@ -242,14 +248,50 @@ async function pickVatTaxesForCompany(odoo, companyId) {
   };
 }
 
+async function resolveIndustry(odoo, companyId) {
+  try {
+    const companies = await odoo.searchRead(
+      "res.company",
+      [["id", "=", companyId]],
+      ["id", "x_studio_industry"],
+      { limit: 1 }
+    );
+    const val = companies?.[0]?.x_studio_industry;
+    if (val) {
+      const industry = Array.isArray(val) ? String(val[1] || val[0] || "") : String(val || "");
+      return industry.trim();
+    }
+  } catch (_) {}
+  return "";
+}
+
 async function resolvePurchaseJournalId(odoo, companyId) {
   const journals = await odoo.searchRead(
     "account.journal",
     [["type", "=", "purchase"], ["company_id", "=", companyId]],
-    ["id"],
-    kwWithCompany(companyId, { limit: 1, order: "id asc" })
+    ["id", "name", "code"],
+    kwWithCompany(companyId, { limit: 20, order: "id asc" })
   );
-  return journals?.[0]?.id ? Number(journals[0].id) : 0;
+  if (!journals.length) return 0;
+
+  const billJournal = journals.find((j) => {
+    const name = String(j.name || "").toLowerCase();
+    const code = String(j.code || "").toLowerCase();
+    return (
+      name.includes("vendor bill") ||
+      name.includes("vendor invoice") ||
+      name.includes("bills") ||
+      code === "bill" ||
+      code === "vb"
+    );
+  });
+  if (billJournal) return Number(billJournal.id);
+
+  const notReceipt = journals.find((j) => {
+    const name = String(j.name || "").toLowerCase();
+    return !name.includes("receipt");
+  });
+  return Number((notReceipt || journals[0]).id);
 }
 
 async function refreshRoutingAutoFields(headers, rows, logger) {
@@ -267,27 +309,33 @@ async function refreshRoutingAutoFields(headers, rows, logger) {
       let apFolderId = 0;
       try { apFolderId = await resolveApFolderId(odoo, g.companyId); } catch (_) {}
 
+      let industryVal = "";
+      try { industryVal = await resolveIndustry(odoo, g.companyId); } catch (_) {}
+
       for (const row of g.rows) {
         const before = [
           String(row.vat_purchase_tax_id_goods || "").trim(),
           String(row.vat_purchase_tax_id_services || "").trim(),
           String(row.vat_purchase_tax_id_generic || "").trim(),
           String(row.purchase_journal_id || "").trim(),
-          String(row.ap_folder_id || "").trim()
+          String(row.ap_folder_id || "").trim(),
+          String(row.industry || "").trim()
         ].join("|");
 
         row.vat_purchase_tax_id_goods = pick.goodsId ? String(pick.goodsId) : "";
         row.vat_purchase_tax_id_services = pick.servicesId ? String(pick.servicesId) : "";
         row.vat_purchase_tax_id_generic = pick.genericId ? String(pick.genericId) : "";
-        if (journalId && !Number(row.purchase_journal_id)) row.purchase_journal_id = String(journalId);
-        if (apFolderId && !Number(row.ap_folder_id)) row.ap_folder_id = String(apFolderId);
+        if (journalId) row.purchase_journal_id = String(journalId);
+        if (apFolderId) row.ap_folder_id = String(apFolderId);
+        if (industryVal) row.industry = industryVal;
 
         const after = [
           String(row.vat_purchase_tax_id_goods || "").trim(),
           String(row.vat_purchase_tax_id_services || "").trim(),
           String(row.vat_purchase_tax_id_generic || "").trim(),
           String(row.purchase_journal_id || "").trim(),
-          String(row.ap_folder_id || "").trim()
+          String(row.ap_folder_id || "").trim(),
+          String(row.industry || "").trim()
         ].join("|");
         if (after !== before) updated += 1;
       }
@@ -348,7 +396,8 @@ function groupRoutingRows(rows) {
           goods: row.vat_purchase_tax_id_goods || 0,
           services: row.vat_purchase_tax_id_services || 0,
           generic: row.vat_purchase_tax_id_generic || 0
-        }
+        },
+        industry: String(row.industry || "").trim()
       });
     }
   }
@@ -509,56 +558,116 @@ async function findVendor(odoo, companyId, extracted, ocrText) {
   const picked = pickVendorFromExtraction(extracted, ocrText);
   const vendorName = String(picked.name || "").trim();
   if (!vendorName) return { id: 0, name: "", confidence: 0, source: picked.source };
-  const vendors = await odoo.searchRead(
-    "res.partner",
-    [
-      ["name", "ilike", vendorName],
-      ["supplier_rank", ">", 0]
-    ],
-    ["id", "name"],
-    kwWithCompany(companyId, { limit: 5, order: "supplier_rank desc,id asc" })
-  );
-  const winner = vendors?.[0];
+
+  const details = extracted?.vendor_details || {};
+  const tradeName = String(details.trade_name || "").trim();
+  const proprietorName = String(details.proprietor_name || "").trim();
+  const searchNames = [vendorName];
+  if (tradeName && tradeName.toLowerCase() !== vendorName.toLowerCase()) searchNames.push(tradeName);
+  if (proprietorName && proprietorName.toLowerCase() !== vendorName.toLowerCase()) searchNames.push(proprietorName);
+
+  for (const name of searchNames) {
+    const vendors = await odoo.searchRead(
+      "res.partner",
+      [["name", "ilike", name], ["supplier_rank", ">", 0]],
+      ["id", "name"],
+      kwWithCompany(companyId, { limit: 5, order: "supplier_rank desc,id asc" })
+    );
+    if (vendors?.length) {
+      return {
+        id: Number(vendors[0].id),
+        name: String(vendors[0].name),
+        confidence: Number(picked.confidence || 0),
+        source: picked.source,
+        entityType: String(details.entity_type || "unknown"),
+        tradeName,
+        proprietorName
+      };
+    }
+  }
+
   return {
-    id: Number(winner?.id || 0),
-    name: String(winner?.name || vendorName),
-    confidence: Number(picked.confidence || 0),
-    source: picked.source
+    id: 0, name: vendorName, confidence: Number(picked.confidence || 0),
+    source: picked.source, entityType: String(details.entity_type || "unknown"),
+    tradeName, proprietorName
   };
 }
 
 async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
   const picked = pickVendorFromExtraction(extracted, ocrText);
-  const name = String(picked.name || "").trim();
+  const rawName = String(picked.name || "").trim();
   const conf = Number(picked.confidence || 0);
-  if (!name) return { status: "missing", partnerId: 0, created: false };
-  if (looksLikeAtpPrinterVendor(name, ocrText) || String(picked.source || "") === "atp_printer_box") {
+  if (!rawName) return { status: "missing", partnerId: 0, created: false };
+  if (looksLikeAtpPrinterVendor(rawName, ocrText) || String(picked.source || "") === "atp_printer_box") {
     return { status: "blocked_printer", partnerId: 0, created: false };
   }
   const AUTOCREATE_VENDOR_MIN = 0.9;
   if (conf < AUTOCREATE_VENDOR_MIN) {
-    return { status: "needs_confirmation", partnerId: 0, created: false, confidence: conf, name };
-  }
-
-  const existing = await odoo.searchRead(
-    "res.partner",
-    [["name", "=", name], ["supplier_rank", ">", 0]],
-    ["id", "name"],
-    kwWithCompany(companyId, { limit: 1 })
-  );
-  if (existing?.length) {
-    return { status: "matched", partnerId: Number(existing[0].id), created: false, name: existing[0].name };
+    return { status: "needs_confirmation", partnerId: 0, created: false, confidence: conf, name: rawName };
   }
 
   const details = extracted?.vendor_details || {};
+  const entityType = String(details.entity_type || "unknown").toLowerCase();
+  const isSoleProp = entityType === "sole_proprietor" || entityType === "individual";
+  const tradeName = String(details.trade_name || "").trim();
+  const proprietorName = String(details.proprietor_name || "").trim();
+
+  const name = isSoleProp && proprietorName ? proprietorName : rawName;
+
+  const searchNames = [name];
+  if (rawName.toLowerCase() !== name.toLowerCase()) searchNames.push(rawName);
+  if (tradeName && tradeName.toLowerCase() !== name.toLowerCase()) searchNames.push(tradeName);
+
+  for (const sn of searchNames) {
+    const existing = await odoo.searchRead(
+      "res.partner",
+      [["name", "ilike", sn], ["supplier_rank", ">", 0]],
+      ["id", "name"],
+      kwWithCompany(companyId, { limit: 1 })
+    );
+    if (existing?.length) {
+      return { status: "matched", partnerId: Number(existing[0].id), created: false, name: existing[0].name };
+    }
+  }
+
   const vals = {
     name,
     supplier_rank: 1
   };
   if (String(details.address || "").trim()) vals.street = String(details.address).trim().slice(0, 255);
   if (String(details.tin || "").trim()) vals.vat = String(details.tin).trim();
-  const newId = await odoo.create("res.partner", vals);
-  return { status: "created", partnerId: Number(newId), created: true, name };
+  const notes = [];
+  if (isSoleProp && tradeName) notes.push(`Trade name: ${tradeName}`);
+  if (isSoleProp && proprietorName && proprietorName.toLowerCase() !== name.toLowerCase()) {
+    notes.push(`Proprietor: ${proprietorName}`);
+  }
+  if (tradeName && !isSoleProp && tradeName.toLowerCase() !== name.toLowerCase()) {
+    notes.push(`DBA: ${tradeName}`);
+  }
+  if (notes.length) vals.comment = notes.join("\n");
+  let newId;
+  try {
+    vals.company_type = isSoleProp ? "person" : "company";
+    newId = await odoo.create("res.partner", vals);
+  } catch (e) {
+    if (String(e?.message || "").includes("company_type")) {
+      delete vals.company_type;
+      if (isSoleProp) vals.is_company = false;
+      else vals.is_company = true;
+      try {
+        newId = await odoo.create("res.partner", vals);
+      } catch (_) {
+        delete vals.is_company;
+        newId = await odoo.create("res.partner", vals);
+      }
+    } else {
+      throw e;
+    }
+  }
+  return {
+    status: "created", partnerId: Number(newId), created: true, name,
+    entityType, tradeName, proprietorName
+  };
 }
 
 function pickTaxIds(vatIds, extracted) {
@@ -623,6 +732,259 @@ async function resolveCurrencyId(odoo, companyId, currencyCode) {
   return rows?.[0]?.id ? Number(rows[0].id) : null;
 }
 
+// --- Expense Account Resolution ---
+
+const expenseAccountsCache = new Map();
+
+async function loadExpenseAccounts(odoo, companyId) {
+  const key = `${companyId}`;
+  if (expenseAccountsCache.has(key)) return expenseAccountsCache.get(key);
+
+  let accounts = [];
+  try {
+    accounts = await odoo.searchRead(
+      "account.account",
+      [
+        ["company_id", "=", companyId],
+        ["account_type", "in", ["expense", "expense_direct_cost"]],
+        ["deprecated", "=", false]
+      ],
+      ["id", "code", "name"],
+      kwWithCompany(companyId, { limit: 500, order: "code asc" })
+    );
+  } catch (_) {
+    try {
+      accounts = await odoo.searchRead(
+        "account.account",
+        [
+          ["company_id", "=", companyId],
+          ["internal_type", "=", "other"],
+          ["deprecated", "=", false],
+          ["code", "like", "6%"]
+        ],
+        ["id", "code", "name"],
+        kwWithCompany(companyId, { limit: 500, order: "code asc" })
+      );
+    } catch (__) {}
+  }
+
+  const result = accounts.map((a) => ({
+    id: Number(a.id),
+    code: String(a.code || ""),
+    name: String(a.name || "")
+  }));
+  expenseAccountsCache.set(key, result);
+  return result;
+}
+
+const vendorAccountCache = new Map();
+
+async function getVendorDefaultAccountId(odoo, companyId, vendorId) {
+  if (!vendorId) return 0;
+  const key = `${companyId}:${vendorId}`;
+  if (vendorAccountCache.has(key)) return vendorAccountCache.get(key);
+
+  let accountId = 0;
+  try {
+    const rows = await odoo.searchRead(
+      "res.partner",
+      [["id", "=", vendorId]],
+      ["id", "property_account_expense_id"],
+      kwWithCompany(companyId, { limit: 1 })
+    );
+    const raw = rows?.[0]?.property_account_expense_id;
+    accountId = raw ? (Array.isArray(raw) ? Number(raw[0]) : Number(raw)) : 0;
+  } catch (_) {}
+  vendorAccountCache.set(key, accountId);
+  return accountId;
+}
+
+let accountMappingCache = null;
+
+async function getAccountMapping() {
+  if (accountMappingCache !== null) return accountMappingCache;
+  try {
+    accountMappingCache = await loadAccountMapping(config);
+  } catch (_) {
+    accountMappingCache = [];
+  }
+  return accountMappingCache;
+}
+
+function lookupAccountMapping(mapping, companyId, category, targetDb) {
+  const cat = String(category || "").trim().toLowerCase();
+  if (!cat) return 0;
+  const db = String(targetDb || "").trim().toLowerCase();
+
+  // Exact match: target_db + company_id + category
+  let match = mapping.find((m) =>
+    m.category === cat &&
+    m.companyId === companyId &&
+    m.targetDb && m.targetDb === db
+  );
+  if (match) return match.accountId;
+
+  // Fallback: company_id + category (no target_db or blank target_db)
+  match = mapping.find((m) =>
+    m.category === cat &&
+    m.companyId === companyId &&
+    !m.targetDb
+  );
+  if (match) return match.accountId;
+
+  // Fallback: category only (global default row with no company_id and no target_db)
+  match = mapping.find((m) => m.category === cat && !m.companyId && !m.targetDb);
+  return match ? match.accountId : 0;
+}
+
+const GENERIC_ACCOUNT_WORDS = new Set([
+  "expense", "expenses", "admin", "administrative", "general", "miscellaneous",
+  "other", "misc", "sundry", "various"
+]);
+
+const CATEGORY_KEYWORDS = {
+  fuel: ["fuel", "gas", "oil", "lpg", "diesel", "petroleum", "gasoline", "petrol"],
+  office_supplies: ["office", "supplies", "stationery", "paper", "toner", "ink"],
+  meals: ["meals", "food", "representation", "entertainment", "catering"],
+  repairs: ["repairs", "maintenance", "repair"],
+  rent: ["rent", "rental", "lease"],
+  professional_fees: ["professional", "fees", "consulting", "legal", "audit", "advisory"],
+  freight: ["freight", "shipping", "delivery", "transport", "logistics", "courier"],
+  utilities: ["utilities", "electricity", "water", "power", "telephone", "internet", "communication", "telecom"],
+  inventory: ["inventory", "cost of goods", "cogs", "merchandise", "stock", "cost of sales"]
+};
+
+function fuzzyMatchAccount(accounts, suggestedName, category, lineDescription) {
+  if (!accounts.length) return 0;
+  const query = String(suggestedName || lineDescription || category || "").toLowerCase();
+  if (!query) return 0;
+
+  const tokens = query.split(/[\s&,/_-]+/).filter((t) => t.length > 2);
+  if (!tokens.length) return 0;
+
+  const extraTokens = CATEGORY_KEYWORDS[String(category || "").toLowerCase()] || [];
+  const allTokens = [...new Set([...tokens, ...extraTokens])];
+  const specificTokens = allTokens.filter((t) => !GENERIC_ACCOUNT_WORDS.has(t));
+
+  let bestId = 0;
+  let bestScore = 0;
+  for (const acct of accounts) {
+    const haystack = `${acct.code} ${acct.name}`.toLowerCase();
+    let score = 0;
+    let specificHits = 0;
+    for (const t of allTokens) {
+      if (haystack.includes(t)) {
+        const weight = GENERIC_ACCOUNT_WORDS.has(t) ? 1 : t.length;
+        score += weight;
+        if (!GENERIC_ACCOUNT_WORDS.has(t)) specificHits++;
+      }
+    }
+    const nameWords = acct.name.toLowerCase().split(/[\s&,/_-]+/).filter((w) => w.length > 2);
+    const genericNameRatio = nameWords.filter((w) => GENERIC_ACCOUNT_WORDS.has(w)).length / (nameWords.length || 1);
+    if (genericNameRatio > 0.5) score = Math.floor(score * 0.4);
+
+    if (score > bestScore || (score === bestScore && specificHits > 0)) {
+      bestScore = score;
+      bestId = acct.id;
+    }
+  }
+  return bestScore >= 4 ? bestId : 0;
+}
+
+function isGenericAccount(acct) {
+  if (!acct) return false;
+  const name = String(acct.name || "").toLowerCase();
+  const nameWords = name.split(/[\s&,/_-]+/).filter((w) => w.length > 2);
+  const genericRatio = nameWords.filter((w) => GENERIC_ACCOUNT_WORDS.has(w)).length / (nameWords.length || 1);
+  return genericRatio > 0.5;
+}
+
+function resolveGeminiCandidate(candidate, expenseAccounts) {
+  if (!candidate || !expenseAccounts?.length) return 0;
+  const id = Number(candidate.account_id || 0);
+  if (id && expenseAccounts.some((a) => a.id === id)) return id;
+  const code = String(candidate.account_code || "").trim();
+  if (code) {
+    const byCode = expenseAccounts.find((a) => a.code === code);
+    if (byCode) return byCode.id;
+  }
+  const name = String(candidate.account_name || "").trim().toLowerCase();
+  if (name) {
+    const byName = expenseAccounts.find((a) => a.name.toLowerCase() === name);
+    if (byName) return byName.id;
+    const byPartial = expenseAccounts.find((a) =>
+      a.name.toLowerCase().includes(name) || name.includes(a.name.toLowerCase())
+    );
+    if (byPartial) return byPartial.id;
+  }
+  return 0;
+}
+
+function pickBestGeminiAccount(geminiPick, expenseAccounts) {
+  if (!geminiPick || !expenseAccounts?.length) return { accountId: 0, source: "gemini" };
+  const primaryId = resolveGeminiCandidate(geminiPick, expenseAccounts);
+  if (primaryId) {
+    const acct = expenseAccounts.find((a) => a.id === primaryId);
+    if (!isGenericAccount(acct)) return { accountId: primaryId, source: "gemini" };
+    const alts = geminiPick.alternatives || [];
+    for (const alt of alts) {
+      const altId = resolveGeminiCandidate(alt, expenseAccounts);
+      if (altId) {
+        const altAcct = expenseAccounts.find((a) => a.id === altId);
+        if (!isGenericAccount(altAcct)) return { accountId: altId, source: "gemini_alt" };
+      }
+    }
+    return { accountId: primaryId, source: "gemini_generic" };
+  }
+  const alts = geminiPick.alternatives || [];
+  for (const alt of alts) {
+    const altId = resolveGeminiCandidate(alt, expenseAccounts);
+    if (altId) return { accountId: altId, source: "gemini_alt" };
+  }
+  return { accountId: 0, source: "gemini" };
+}
+
+async function resolveExpenseAccountId({
+  odoo, companyId, vendorId, category, suggestedName,
+  geminiPick, expenseAccounts, accountMapping, targetDb,
+  lineDescription, vendorName
+}) {
+  // Tier 1: vendor default
+  const vendorAcct = await getVendorDefaultAccountId(odoo, companyId, vendorId);
+  if (vendorAcct) return { accountId: vendorAcct, source: "vendor_default" };
+
+  // Tier 2: Gemini pick (validated + repaired via code/name, anti-generic guard)
+  if (geminiPick && expenseAccounts?.length) {
+    const result = pickBestGeminiAccount(geminiPick, expenseAccounts);
+    if (result.accountId) return result;
+  }
+
+  // Tier 3: vendor name keywords (e.g. "FABRIC TRADING" → Supplies)
+  if (vendorName && expenseAccounts?.length) {
+    const vnHint = vendorNameAccountHint(vendorName, expenseAccounts);
+    if (vnHint) return { accountId: vnHint, source: "vendor_name_hint" };
+  }
+
+  // Tier 4: sheet mapping (AccountMapping tab)
+  if (accountMapping?.length) {
+    const mapped = lookupAccountMapping(accountMapping, companyId, category, targetDb);
+    if (mapped) return { accountId: mapped, source: "sheet_mapping" };
+  }
+
+  // Tier 5: fuzzy name match using line description + category keywords
+  if (expenseAccounts?.length) {
+    const fuzzy = fuzzyMatchAccount(expenseAccounts, suggestedName, category, lineDescription);
+    if (fuzzy) return { accountId: fuzzy, source: "fuzzy_match" };
+  }
+
+  // Tier 6: env fallback
+  if (config.odooDefaults.defaultExpenseAccountId > 0) {
+    return { accountId: config.odooDefaults.defaultExpenseAccountId, source: "env_fallback" };
+  }
+
+  return { accountId: 0, source: "none" };
+}
+
 function adjustPriceForTax(price, invoiceVatInclusive, taxPriceInclude, taxRate) {
   if (!price) return price;
   if (invoiceVatInclusive && !taxPriceInclude) {
@@ -634,7 +996,107 @@ function adjustPriceForTax(price, invoiceVatInclusive, taxPriceInclude, taxRate)
   return price;
 }
 
-function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId, currencyId, taxMeta) {
+function lineItemsTotalMatchesInvoice(lineItems, expectedTotal) {
+  if (!lineItems.length || !expectedTotal) return false;
+  const lineSum = lineItems.reduce((s, li) => s + Number(li.amount || 0), 0);
+  if (!lineSum) return false;
+  const diff = Math.abs(lineSum - expectedTotal) / expectedTotal;
+  return diff < 0.05;
+}
+
+function extractOcrAmounts(ocrText) {
+  if (!ocrText) return [];
+  const matches = ocrText.match(/[\d,]+\.?\d*/g) || [];
+  return matches
+    .map((s) => Number(s.replace(/,/g, "")))
+    .filter((n) => n >= 100 && Number.isFinite(n));
+}
+
+function fixExtractedAmounts(extracted, ocrText, logger) {
+  const totals = extracted?.totals;
+  if (!totals) return;
+  const grandTotal = Number(totals.grand_total || 0);
+  if (!grandTotal) return;
+
+  const ocrAmounts = extractOcrAmounts(ocrText);
+  if (!ocrAmounts.length) return;
+
+  const maxOcr = Math.max(...ocrAmounts);
+  if (maxOcr <= grandTotal * 1.5) return;
+
+  const ratio = maxOcr / grandTotal;
+  if (ratio >= 5 && ratio <= 15) {
+    const nearMax = ocrAmounts.filter((a) => Math.abs(a - maxOcr) / maxOcr < 0.02);
+    if (nearMax.length >= 1) {
+      if (logger) logger.info("Amount correction: Gemini total appears truncated.", {
+        geminiTotal: grandTotal, ocrMax: maxOcr, ratio: ratio.toFixed(1), nearMatches: nearMax.length
+      });
+      totals.grand_total = maxOcr;
+      totals.grand_total_confidence = Math.min(totals.grand_total_confidence || 0.5, 0.7);
+      if (totals.net_total && totals.net_total < maxOcr) {
+        totals.net_total = maxOcr;
+      }
+      const lineItems = extracted?.line_items || [];
+      if (lineItems.length === 1) {
+        const li = lineItems[0];
+        const liAmount = Number(li.amount || 0);
+        if (liAmount && liAmount < maxOcr && maxOcr / liAmount >= 5) {
+          li.amount = maxOcr;
+          if (li.quantity === 1 || !li.quantity) {
+            li.unit_price = maxOcr;
+          } else if (li.quantity > 0) {
+            li.unit_price = Math.round((maxOcr / li.quantity) * 100) / 100;
+          }
+        }
+      }
+    }
+  }
+}
+
+const VENDOR_NAME_ACCOUNT_KEYWORDS = {
+  fabric: ["supplies", "raw materials", "inventory", "cost of sales", "cost of goods"],
+  textile: ["supplies", "raw materials", "inventory", "cost of sales"],
+  cloth: ["supplies", "raw materials", "inventory"],
+  hardware: ["supplies", "repairs", "maintenance", "hardware"],
+  lumber: ["raw materials", "supplies", "cost of sales", "construction"],
+  gas: ["fuel", "oil", "gas", "transportation"],
+  fuel: ["fuel", "oil", "gas", "transportation"],
+  petroleum: ["fuel", "oil", "gas", "petroleum"],
+  food: ["meals", "food", "representation", "entertainment"],
+  catering: ["meals", "food", "representation", "catering"],
+  restaurant: ["meals", "food", "representation"],
+  electrical: ["supplies", "electrical", "utilities"],
+  plumbing: ["supplies", "plumbing", "repairs"],
+  printing: ["printing", "supplies", "office"],
+  stationery: ["office supplies", "stationery"],
+  pharmacy: ["medical", "supplies", "medicine"],
+  auto: ["repairs", "maintenance", "transportation"],
+  tire: ["repairs", "maintenance", "transportation"],
+  cement: ["raw materials", "construction", "supplies"],
+  steel: ["raw materials", "construction", "supplies"],
+  paint: ["supplies", "paint", "maintenance"],
+  chemical: ["supplies", "chemicals", "raw materials"],
+  laundry: ["laundry", "supplies", "services"],
+  cleaning: ["janitorial", "cleaning", "supplies"]
+};
+
+function vendorNameAccountHint(vendorName, expenseAccounts) {
+  if (!vendorName || !expenseAccounts?.length) return 0;
+  const vn = String(vendorName).toLowerCase();
+  for (const [keyword, searchTerms] of Object.entries(VENDOR_NAME_ACCOUNT_KEYWORDS)) {
+    if (!vn.includes(keyword)) continue;
+    for (const term of searchTerms) {
+      const match = expenseAccounts.find((a) => {
+        const name = a.name.toLowerCase();
+        return name.includes(term) && !isGenericAccount(a);
+      });
+      if (match) return match.id;
+    }
+  }
+  return 0;
+}
+
+function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId, currencyId, taxMeta, lineAccountIds) {
   const inv = extracted?.invoice || {};
   const totals = extracted?.totals || {};
   const grandTotal = Number(totals.grand_total || 0);
@@ -651,10 +1113,13 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
   const ref = String(inv.number || "").trim();
 
   const lineItems = extracted?.line_items || [];
+  const useLineItems = lineItems.length > 0 && lineItemsTotalMatchesInvoice(lineItems, grandTotal || netTotal || 0);
+  const hint = extracted?.expense_account_hint || {};
   const invoiceLines = [];
 
-  if (lineItems.length > 0) {
-    for (const item of lineItems) {
+  if (useLineItems) {
+    for (let i = 0; i < lineItems.length; i++) {
+      const item = lineItems[i];
       const itemVatInclusive = item.unit_price_includes_vat ?? globalVatInclusive;
       const rawPrice = Number(item.unit_price || item.amount || 0);
       const line = {
@@ -662,27 +1127,21 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
         quantity: Number(item.quantity) || 1,
         price_unit: hasTax ? adjustPriceForTax(rawPrice, itemVatInclusive, taxPriceInclude, taxRate) : rawPrice
       };
-      if (config.odooDefaults.defaultExpenseAccountId > 0) {
-        line.account_id = Number(config.odooDefaults.defaultExpenseAccountId);
-      }
-      if (hasTax) {
-        line.tax_ids = [[6, 0, taxIds]];
-      }
+      const acctId = lineAccountIds?.[i] || 0;
+      if (acctId) line.account_id = acctId;
+      if (hasTax) line.tax_ids = [[6, 0, taxIds]];
       invoiceLines.push([0, 0, line]);
     }
   } else {
     const adjustedTotal = hasTax ? adjustPriceForTax(total, globalVatInclusive, taxPriceInclude, taxRate) : total;
     const line = {
-      name: String(extracted?.expense_account_hint?.suggested_account_name || "OCR Vendor Bill").slice(0, 256),
+      name: String(hint.suggested_account_name || "OCR Vendor Bill").slice(0, 256),
       quantity: 1,
       price_unit: adjustedTotal
     };
-    if (config.odooDefaults.defaultExpenseAccountId > 0) {
-      line.account_id = Number(config.odooDefaults.defaultExpenseAccountId);
-    }
-    if (hasTax) {
-      line.tax_ids = [[6, 0, taxIds]];
-    }
+    const acctId = lineAccountIds?.[0] || 0;
+    if (acctId) line.account_id = acctId;
+    if (hasTax) line.tax_ids = [[6, 0, taxIds]];
     invoiceLines.push([0, 0, line]);
   }
 
@@ -715,22 +1174,35 @@ async function documentsDocumentHasField(odoo, fieldName) {
   }
 }
 
-async function attachCopyToBill(odoo, companyId, att, billId, docId) {
+async function attachFileToBillChatter(odoo, companyId, att, billId, docId) {
   if (!att?.datas) return;
-  await odoo.create("ir.attachment", {
-    name: att.name,
-    mimetype: att.mimetype,
-    datas: att.datas,
-    res_model: "account.move",
-    res_id: Number(billId),
-    description: `Copied from documents.document#${docId} original_attachment#${att.id}`
-  });
+  try {
+    const chatAttId = await odoo.create("ir.attachment", {
+      name: att.name,
+      mimetype: att.mimetype,
+      datas: att.datas,
+      res_model: "mail.compose.message",
+      res_id: 0,
+      description: `Source: documents.document#${docId} attachment#${att.id}`
+    });
+    await odoo.executeKw(
+      "account.move",
+      "message_post",
+      [[Number(billId)]],
+      kwWithCompany(companyId, {
+        body: `📄 Original document file attached (doc #${docId})`,
+        message_type: "comment",
+        attachment_ids: [Number(chatAttId)]
+      })
+    );
+  } catch (_err) {
+    // best effort
+  }
+}
 
-  // Keep original attached to documents record.
-  await odoo.write("ir.attachment", [att.id], {
-    res_model: "documents.document",
-    res_id: Number(docId)
-  });
+function readFolderId(docRow) {
+  const raw = docRow?.folder_id;
+  return raw ? (Array.isArray(raw) ? Number(raw[0]) : Number(raw)) : 0;
 }
 
 async function linkDocumentToBill(odoo, companyId, docId, billId, logger) {
@@ -740,37 +1212,37 @@ async function linkDocumentToBill(odoo, companyId, docId, billId, logger) {
     ["id", "folder_id"],
     kwWithCompany(companyId, { limit: 1 })
   );
-  const originalFolderId = docRows?.[0]?.folder_id
-    ? (Array.isArray(docRows[0].folder_id) ? docRows[0].folder_id[0] : Number(docRows[0].folder_id))
-    : 0;
+  const originalFolderId = readFolderId(docRows?.[0]);
 
-  const vals = {};
-  if (await documentsDocumentHasField(odoo, "res_model")) vals.res_model = "account.move";
-  if (await documentsDocumentHasField(odoo, "res_id")) vals.res_id = Number(billId);
-  if (await documentsDocumentHasField(odoo, "account_move_id")) vals.account_move_id = Number(billId);
-  if (await documentsDocumentHasField(odoo, "invoice_id")) vals.invoice_id = Number(billId);
-  if (originalFolderId) vals.folder_id = originalFolderId;
+  const linkVals = {};
+  if (await documentsDocumentHasField(odoo, "res_model")) linkVals.res_model = "account.move";
+  if (await documentsDocumentHasField(odoo, "res_id")) linkVals.res_id = Number(billId);
+  if (await documentsDocumentHasField(odoo, "account_move_id")) linkVals.account_move_id = Number(billId);
+  if (await documentsDocumentHasField(odoo, "invoice_id")) linkVals.invoice_id = Number(billId);
 
-  if (Object.keys(vals).length) {
-    await odoo.write("documents.document", [Number(docId)], vals);
+  if (Object.keys(linkVals).length) {
+    await odoo.write("documents.document", [Number(docId)], linkVals);
   }
 
   if (originalFolderId) {
-    try {
-      const afterWrite = await odoo.searchRead(
-        "documents.document",
-        [["id", "=", Number(docId)]],
-        ["id", "folder_id"],
-        kwWithCompany(companyId, { limit: 1 })
-      );
-      const newFolderId = afterWrite?.[0]?.folder_id
-        ? (Array.isArray(afterWrite[0].folder_id) ? afterWrite[0].folder_id[0] : Number(afterWrite[0].folder_id))
-        : 0;
-      if (newFolderId && newFolderId !== originalFolderId) {
+    const delays = [1500, 2500, 4000];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      await sleep(delays[attempt]);
+      try {
+        const rows = await odoo.searchRead(
+          "documents.document",
+          [["id", "=", Number(docId)]],
+          ["id", "folder_id"],
+          kwWithCompany(companyId, { limit: 1 })
+        );
+        const currentFolderId = readFolderId(rows?.[0]);
+        if (currentFolderId === originalFolderId) break;
         await odoo.write("documents.document", [Number(docId)], { folder_id: originalFolderId });
-        if (logger) logger.info("Restored document folder after link.", { docId, originalFolderId, movedTo: newFolderId });
-      }
-    } catch (_) {}
+        if (logger) logger.info("Restored document folder after link.", {
+          docId, originalFolderId, movedTo: currentFolderId, attempt: attempt + 1
+        });
+      } catch (_) {}
+    }
   }
 
   const baseUrl = odoo.baseUrl || "";
@@ -792,7 +1264,8 @@ async function processOneDocument(args) {
     targetKey,
     doc,
     vatIds,
-    purchaseJournalId
+    purchaseJournalId,
+    industry
   } = args;
   const attachmentId = m2oId(doc.attachment_id);
   if (!attachmentId) return { status: "skip", reason: "no_attachment" };
@@ -855,6 +1328,7 @@ async function processOneDocument(args) {
   }
 
   const extracted = await extractInvoiceWithGemini(ocrText, config, att);
+  fixExtractedAmounts(extracted, ocrText, logger);
   let vendor = await findVendor(odoo, companyId, extracted, ocrText);
   if (!vendor.id) {
     const createdVendor = await createVendorIfMissing(odoo, companyId, extracted, ocrText);
@@ -906,6 +1380,77 @@ async function processOneDocument(args) {
   const currencyId = await resolveCurrencyId(odoo, companyId, currencyCode);
   const taxIds = pickTaxIds(vatIds, extracted);
   const taxMeta = await getTaxMeta(odoo, companyId, taxIds);
+
+  // --- Account resolution ---
+  const expenseAccounts = await loadExpenseAccounts(odoo, companyId);
+  const accountMapping = await getAccountMapping();
+  let geminiAssignments = null;
+  try {
+    geminiAssignments = await assignAccountsWithGemini(extracted, expenseAccounts, config, industry, ocrText);
+    if (geminiAssignments) {
+      logger.info("Gemini Pass 2 account assignments.", {
+        docId: doc.id,
+        billLevel: {
+          accountId: geminiAssignments.bill_level_account_id,
+          code: geminiAssignments.bill_level_account_code,
+          name: geminiAssignments.bill_level_account_name,
+          conf: geminiAssignments.bill_level_confidence
+        },
+        assignments: (geminiAssignments.assignments || []).map((a) => ({
+          line: a.line_index,
+          accountId: a.account_id,
+          code: a.account_code,
+          name: a.account_name,
+          conf: a.confidence,
+          reason: (a.reasoning || "").slice(0, 80),
+          alts: (a.alternatives || []).map((alt) => ({
+            id: alt.account_id, code: alt.account_code, name: alt.account_name, conf: alt.confidence
+          }))
+        }))
+      });
+    } else {
+      logger.warn("Gemini Pass 2 returned null.", { docId: doc.id });
+    }
+  } catch (err) {
+    logger.warn("Gemini Pass 2 failed.", { docId: doc.id, error: err?.message || String(err) });
+  }
+
+  const lineItems = extracted?.line_items || [];
+  const hint = extracted?.expense_account_hint || {};
+  const grandTotal = Number(extracted?.totals?.grand_total || 0);
+  const netTotal = Number(extracted?.totals?.net_total || 0);
+  const useLines = lineItems.length > 0 && lineItemsTotalMatchesInvoice(lineItems, grandTotal || netTotal || 0);
+
+  const lineCount = useLines ? lineItems.length : 1;
+  const lineAccountIds = [];
+  for (let i = 0; i < lineCount; i++) {
+    const item = useLines ? lineItems[i] : null;
+    const category = item?.expense_category || hint.category || "other";
+    const lineDesc = item ? String(item.description || "").trim() : "";
+    const suggestedName = hint.suggested_account_name || lineDesc || "";
+    const geminiLinePick = geminiAssignments?.assignments?.find((a) => a.line_index === i);
+    const geminiPick = geminiLinePick || (i === 0 && geminiAssignments ? {
+      account_id: geminiAssignments.bill_level_account_id,
+      account_code: geminiAssignments.bill_level_account_code || "",
+      account_name: geminiAssignments.bill_level_account_name || "",
+      confidence: geminiAssignments.bill_level_confidence || 0,
+      reasoning: "bill-level fallback",
+      alternatives: []
+    } : null);
+
+    const resolved = await resolveExpenseAccountId({
+      odoo, companyId, vendorId: vendor.id,
+      category, suggestedName, geminiPick,
+      expenseAccounts, accountMapping, targetDb: odoo.db,
+      lineDescription: lineDesc, vendorName: vendor.name
+    });
+    lineAccountIds.push(resolved.accountId);
+    logger.info("Account resolved.", {
+      docId: doc.id, line: i, category, lineDesc: lineDesc.slice(0, 40),
+      accountId: resolved.accountId, source: resolved.source
+    });
+  }
+
   const billVals = buildBillVals(
     extracted,
     vendor.id,
@@ -913,7 +1458,8 @@ async function processOneDocument(args) {
     taxIds,
     purchaseJournalId,
     currencyId,
-    taxMeta
+    taxMeta,
+    lineAccountIds
   );
   const billId = await odoo.create("account.move", billVals);
   const marker = makeProcessedMarker(
@@ -926,7 +1472,7 @@ async function processOneDocument(args) {
   await odoo.write("ir.attachment", [att.id], {
     description: appendMarker(att.description, marker)
   });
-  await attachCopyToBill(odoo, companyId, att, Number(billId), Number(doc.id));
+  await attachFileToBillChatter(odoo, companyId, att, Number(billId), Number(doc.id));
   await linkDocumentToBill(odoo, companyId, Number(doc.id), Number(billId), logger);
   await safeMessagePost(
     odoo,
@@ -935,6 +1481,54 @@ async function processOneDocument(args) {
     doc.id,
     `✅ Draft Vendor Bill created: account.move #${billId}\nVendor=${vendor.name || "(unknown)"}`
   );
+
+  {
+    const vd = extracted?.vendor_details || {};
+    const et = String(vd.entity_type || vendor.entityType || "unknown").toLowerCase();
+    const entityLabel = et === "sole_proprietor" ? "Sole Proprietor"
+      : et === "corporation" ? "Corporation"
+      : et === "individual" ? "Individual"
+      : "Unknown";
+    const tn = String(vd.trade_name || vendor.tradeName || "").trim();
+    const pn = String(vd.proprietor_name || vendor.proprietorName || "").trim();
+    const vendorMsg = [
+      `🔍 <b>Vendor extraction</b>`,
+      `Name: ${vendor.name || "(unknown)"} | Confidence: ${Number(extracted?.vendor?.confidence || 0).toFixed(2)}`,
+      `Entity type: <b>${entityLabel}</b>`,
+      tn && tn.toLowerCase() !== (vendor.name || "").toLowerCase() ? `Trade name: ${tn}` : null,
+      pn ? `Proprietor/Owner: ${pn}` : null,
+      vd.tin ? `TIN: ${vd.tin}` : null,
+      vd.address ? `Address: ${vd.address}` : null,
+      vendor.created ? `<i>Vendor auto-created in Odoo (as ${et === "sole_proprietor" || et === "individual" ? "Individual" : "Company"})</i>` : null
+    ].filter(Boolean).join("<br/>");
+    await safeMessagePost(odoo, companyId, "account.move", Number(billId), vendorMsg);
+  }
+
+  {
+    const lines = [];
+    for (let i = 0; i < lineAccountIds.length; i++) {
+      const acctId = lineAccountIds[i];
+      const acct = acctId ? expenseAccounts.find((a) => a.id === acctId) : null;
+      const li = useLines && lineItems[i] ? lineItems[i] : null;
+      const desc = li ? String(li.description || "").slice(0, 60) : "Single line";
+      lines.push(`Line ${i + 1}: ${desc} → ${acct ? `${acct.code} ${acct.name}` : `(account #${acctId || "default"})`}`);
+    }
+    const acctMsg = [`💡 <b>Account suggestions</b>`, ...lines].join("<br/>");
+    await safeMessagePost(odoo, companyId, "account.move", Number(billId), acctMsg);
+  }
+
+  {
+    const t = extracted?.totals || {};
+    const amtMsg = [
+      `📊 <b>Extracted amounts</b>`,
+      `Grand total: ${Number(t.grand_total || 0).toFixed(2)} | Net total: ${Number(t.net_total || 0).toFixed(2)} | Tax: ${Number(t.tax_total || 0).toFixed(2)}`,
+      `VAT-inclusive prices: ${t.amounts_are_vat_inclusive ? "Yes" : "No"} | Currency: ${extracted?.invoice?.currency || "(not detected)"}`,
+      extracted?.invoice?.number ? `Invoice #: ${extracted.invoice.number}` : null,
+      extracted?.invoice?.date ? `Invoice date: ${extracted.invoice.date}` : null
+    ].filter(Boolean).join("<br/>");
+    await safeMessagePost(odoo, companyId, "account.move", Number(billId), amtMsg);
+  }
+
   if ((extracted?.warnings || []).length || Number(extracted?.vendor?.confidence || 0) < 0.9) {
     await safeMessagePost(
       odoo,
@@ -955,9 +1549,14 @@ async function processTargetGroup(target, startMs, logger) {
   if (!apFolderId) apFolderId = await resolveApFolderId(odoo, target.companyId);
 
   const docs = await listCandidateDocuments(odoo, target.companyId, apFolderId);
-  const docsSorted = docs
-    .filter((d) => Number(d.id) > Number(state.last_doc_id || 0))
+  const lastProcessed = Number(state.last_doc_id || 0);
+  const newDocs = docs
+    .filter((d) => Number(d.id) > lastProcessed)
     .sort((a, b) => Number(a.id) - Number(b.id));
+  const revisitDocs = docs
+    .filter((d) => Number(d.id) <= lastProcessed)
+    .sort((a, b) => Number(a.id) - Number(b.id));
+  const docsSorted = [...newDocs, ...revisitDocs];
 
   const stats = {
     scanned: 0,
@@ -983,7 +1582,8 @@ async function processTargetGroup(target, startMs, logger) {
         targetKey: target.targetKey,
         doc,
         vatIds: target.vatIds,
-        purchaseJournalId: target.purchaseJournalId
+        purchaseJournalId: target.purchaseJournalId,
+        industry: target.industry
       });
       if (result.status === "ok") stats.created += 1;
       else stats.skipped += 1;
@@ -1005,6 +1605,7 @@ async function processTargetGroup(target, startMs, logger) {
 }
 
 async function runOne({ logger, payload = {} }) {
+  clearPerRunCaches();
   const routingRows = await getRoutingRows(logger);
   const targets = groupRoutingRows(routingRows);
   if (!targets.length) {
@@ -1031,19 +1632,38 @@ async function runOne({ logger, payload = {} }) {
   const odoo = new OdooClient(target.targetCfg);
   const companyId = Number(target.companyId);
 
+  const docFields = ["id", "name", "attachment_id", "folder_id", "company_id", "create_date", "res_model", "res_id"];
   let docs = [];
   if (docId) {
     docs = await odoo.searchRead(
       "documents.document",
       [["id", "=", docId], ["is_folder", "=", false]],
-      ["id", "name", "attachment_id", "folder_id", "company_id", "create_date"],
+      docFields,
       kwWithCompany(companyId, { limit: 1 })
     );
+    if (!docs?.length) {
+      docs = await odoo.searchRead(
+        "documents.document",
+        [["id", "=", docId]],
+        docFields,
+        { limit: 1 }
+      );
+    }
+    if (!docs?.length) {
+      try {
+        docs = await odoo.searchRead(
+          "documents.document",
+          [["id", "=", docId], ["active", "in", [true, false]]],
+          docFields,
+          { limit: 1 }
+        );
+      } catch (_) {}
+    }
   } else {
     docs = await odoo.searchRead(
       "documents.document",
       [["attachment_id", "=", attachmentId], ["is_folder", "=", false]],
-      ["id", "name", "attachment_id", "folder_id", "company_id", "create_date"],
+      docFields,
       kwWithCompany(companyId, { limit: 1, order: "id desc" })
     );
   }
@@ -1052,9 +1672,27 @@ async function runOne({ logger, payload = {} }) {
   if (!doc) {
     throw new Error(
       docId
-        ? `Document not found for doc_id=${docId}.`
+        ? `Document not found for doc_id=${docId}. It may have been deleted from Odoo (check Odoo trash/archive). Try uploading the file again to the AP folder to get a new doc_id.`
         : `Document not found for attachment_id=${attachmentId}.`
     );
+  }
+
+  if (doc.res_model === "account.move" && doc.res_id) {
+    const billExists = await odoo.searchRead(
+      "account.move",
+      [["id", "=", Number(doc.res_id)]],
+      ["id"],
+      kwWithCompany(companyId, { limit: 1 })
+    );
+    if (!billExists?.length) {
+      logger.info("Clearing stale bill link from document (bill was deleted).", {
+        docId: doc.id, staleBillId: doc.res_id
+      });
+      const clearVals = { res_model: false, res_id: false };
+      try { clearVals.account_move_id = false; } catch (_) {}
+      try { clearVals.invoice_id = false; } catch (_) {}
+      await odoo.write("documents.document", [Number(doc.id)], clearVals);
+    }
   }
 
   const result = await processOneDocument({
@@ -1064,7 +1702,8 @@ async function runOne({ logger, payload = {} }) {
     targetKey: target.targetKey,
     doc,
     vatIds: target.vatIds,
-    purchaseJournalId: target.purchaseJournalId
+    purchaseJournalId: target.purchaseJournalId,
+    industry: target.industry
   });
 
   return {
@@ -1126,7 +1765,14 @@ async function listApDocuments({ logger, payload = {} }) {
   };
 }
 
+function clearPerRunCaches() {
+  expenseAccountsCache.clear();
+  vendorAccountCache.clear();
+  accountMappingCache = null;
+}
+
 async function runWorker({ logger }) {
+  clearPerRunCaches();
   const startMs = Date.now();
   const routingRows = await getRoutingRows(logger);
   const targets = groupRoutingRows(routingRows);
