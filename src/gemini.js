@@ -181,9 +181,10 @@ const extractionSchema = {
           unit_price: { type: "number" },
           amount: { type: "number" },
           unit_price_includes_vat: { type: "boolean", description: "true if the unit_price shown on the invoice already includes VAT" },
-          expense_category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|freight|utilities|inventory|other" }
+          expense_category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|freight|utilities|inventory|other" },
+          vat_code: { type: "string", description: "Per-line VAT treatment: vatable|exempt|zero_rated|no_vat. Use 'no_vat' when the line explicitly says NO VAT or is non-vatable. Use 'vatable' when VAT applies." }
         },
-        required: ["description", "quantity", "unit_price", "amount", "unit_price_includes_vat", "expense_category"]
+        required: ["description", "quantity", "unit_price", "amount", "unit_price_includes_vat", "expense_category", "vat_code"]
       }
     },
     warnings: { type: "array", items: { type: "string" } }
@@ -210,6 +211,13 @@ CRITICAL PH RECEIPT RULES:
 - Ignore names near keywords: "ATP", "BIR Permit", "Printer", "Accreditation", "Date issued", "O.R. No.", "VAT Reg. TIN" when those appear inside printer/ATP blocks.
 - The vendor is the SELLER/ISSUER (usually top header near "OFFICIAL RECEIPT", "SALES INVOICE", or company address), not the printing company.
 
+VENDOR IDENTITY — SAME BRAND, DIFFERENT LEGAL ENTITIES (CRITICAL):
+- Invoices may mention multiple related names (e.g. "Proseso Consulting", "Proseso Outsourcing Services Inc.", "Proseso Consulting Pte. Ltd."). The vendor for THIS invoice is the legal entity that IS ISSUING this document and receiving payment.
+- PREFER in this order: (1) The exact name in "Account Name" or "Bank Account Name" in the payment/bank details section — that is who gets paid. (2) The company name in the footer or letterhead that appears on every page as the issuer. (3) The name next to the issuer address (e.g. "Proseso Outsourcing Services Inc." above "3rd Floor, ABC Building...").
+- DO NOT use: the name from the website URL (e.g. proseso-consulting.com), or from generic boilerplate like "Payments to Proseso Consulting" or "Proseso Consulting, as a service provider". Those refer to the brand, not necessarily the legal issuer.
+- If the document shows "Pte. Ltd." (Singapore) in one place and "Inc." (Philippines) in another, and the bank details or footer show the Philippine entity, the vendor is the Philippine entity (Inc.), not the Singapore one (Pte. Ltd.), unless the invoice is clearly issued by the Singapore entity.
+- vendor_details.address must be the address of the ISSUER (the vendor), not the client/customer. The client is who is being billed; the vendor is who sent the invoice and receives payment.
+
 OUTPUT REQUIREMENTS:
 - vendor.source must be one of: header|body|atp_printer_box|unknown
 - vendor_candidates should include up to 5 plausible vendors with source + confidence.
@@ -217,12 +225,20 @@ OUTPUT REQUIREMENTS:
 - totals.* may be best guess, but if uncertain, lower confidence and add warnings.
 
 AMOUNT INTEGRITY RULES (CRITICAL):
-- NEVER "correct" a line item amount downward to match a smaller total. If qty × unit_price gives a larger number than the OCR total, the total OCR is likely wrong, not the line item.
+- grand_total MUST be the FINAL TOTAL / AMOUNT DUE on the invoice — the bottom-line number the buyer owes. It must NOT be a subtotal, a single line item amount, a VAT amount, or any intermediate number. If the invoice has multiple line items, the grand_total MUST be larger than any single line item.
+- CROSS-CHECK: If you extracted line items, SUM them. The grand_total must be >= the sum of all line item amounts (possibly with VAT on top). If grand_total < line item sum, you likely picked the wrong number as grand_total.
+- NEVER "correct" a line item amount downward to match a smaller total. If qty x unit_price gives a larger number than the OCR total, the total OCR is likely wrong, not the line item.
 - Handwritten amounts are often misread. Common OCR confusions: "0" vs empty space, "5" vs "S", missing trailing zeros (e.g. "1045" should be "10450" or "10500").
-- Cross-check: qty × unit_price should equal the line amount. If the math works for one reading but not another, trust the one where the math works.
-- When line item math (qty × unit_price) and the printed/written total disagree, prefer the LARGER amount if the smaller one looks like a truncation or missing digit.
-- Put conflicting readings in amount_candidates with confidence scores so the system can audit them.
+- Cross-check: qty x unit_price should equal the line amount. If the math works for one reading but not another, trust the one where the math works.
+- When line item math (qty x unit_price) and the printed/written total disagree, prefer the reading where the arithmetic is consistent, NOT just the larger one.
+- IMPORTANT: The grand total should be PLAUSIBLE given the line items. If line items sum to ~26000, the grand total cannot be 2800 (that's one line item, not the total). A grand total that is much smaller than the line item sum is almost certainly a misread.
+- When the TOTAL line is handwritten and you also have individual line item amounts, cross-check: if the total is wildly different from the sum of readable line items, the total is likely misread. Use the line item sum or the closest amount_candidate instead.
+- Put ALL plausible readings of the total in amount_candidates with confidence scores so the system can audit them. Include the line item sum as a candidate if it differs from the printed total.
 - NEVER silently drop trailing zeros from amounts. "10500" is NOT the same as "1050" or "1045".
+- DECIMAL POINT DETECTION: Handwritten decimal points are easy to miss. If a number like "80177" appears where you would expect ~8017.7, it's likely "8017.7" with a missed decimal.
+- CRITICAL: grand_total must NEVER be a VAT/tax component. "VAT Amount: 428.57" or "Tax: 428.57" means the TAX is 428.57, NOT the total. The grand_total is the FINAL amount due (typically vatable_sales + vat_amount, or "Total Amount Due"). If grand_total ≈ tax_total, you picked the WRONG number.
+- If tax_total > grand_total, you definitely have the wrong grand_total (tax cannot exceed total). Re-examine the document.
+- EXTRACT ALL LINE ITEMS: Do NOT skip items. If the invoice lists 10 products, extract all 10. The sum of line item amounts should approximately equal the grand_total. If you only found one line item but the invoice clearly has more, re-examine carefully — especially if there is a PDF/image attached.
 
 HANDWRITTEN / LOW-QUALITY OCR RULES:
 - Many PH receipts are handwritten. OCR of handwriting is unreliable.
@@ -258,10 +274,10 @@ VENDOR DETAIL REQUIREMENTS (PH):
   - "SM PRIME HOLDINGS, INC." → entity_type="corporation", trade_name="SM PRIME HOLDINGS, INC.", proprietor_name=""
 
 PH VAT RULES (IMPORTANT):
-- Decide vat.classification:
-  - "exempt" if receipt shows "VAT Exempt", "VAT-ExEMPT", or has a VAT-exempt amount column/value.
-  - "zero_rated" if receipt shows "Zero Rated", "0% ZR", or similar.
-  - "vatable" if receipt shows VAT amount, "VAT Sales", "Vatable Sales", or indicates 12% VAT.
+- Decide vat.classification (BILL LEVEL — if ANY line has VAT, classification should be "vatable"):
+  - "exempt" if ALL lines are VAT Exempt.
+  - "zero_rated" if ALL lines are Zero Rated.
+  - "vatable" if ANY line has VAT / shows 12% VAT. Even if some lines say "NO VAT", set bill-level to "vatable" when at least one line IS vatable.
   - "unknown" if none of the above.
 - Decide vat.goods_or_services:
   - "services" if wording indicates services (professional fees, rentals, repairs, consulting, labor, contractors, etc.).
@@ -273,6 +289,15 @@ PH VAT RULES (IMPORTANT):
   - vat.exempt_amount
   - vat.zero_rated_amount
 - Put the key supporting text into vat.evidence.
+
+PER-LINE VAT (CRITICAL — different lines may have different VAT treatment):
+- For EACH line_item, set vat_code to one of: vatable | exempt | zero_rated | no_vat
+- "no_vat" means the line explicitly says "NO VAT", "Non-VAT", or has no VAT applied.
+- "vatable" means the line has VAT (12%).
+- "exempt" means the line is VAT-exempt.
+- "zero_rated" means the line is zero-rated.
+- IMPORTANT: An invoice can have MIXED VAT treatment. For example, a reimbursement line with NO VAT and a service fee line WITH 12% VAT. Each line must have its own vat_code.
+- Do NOT assume all lines have the same VAT treatment. Read the taxes column for each line carefully.
 
 Also copy exempt/zero-rated amounts into:
 - totals.vat_exempt_amount, totals.zero_rated_amount (if known).
@@ -297,6 +322,25 @@ LINE ITEM CATEGORIZATION:
   fabric/cloth/textile/thread -> "inventory" or "supplies", hardware/tools -> "supplies", lumber/cement -> "inventory"
 - If the item description is unreadable or a brand name (e.g. "Hiroshi #7" from a fabric vendor), use the VENDOR NAME to determine the category. A fabric vendor sells fabric → "inventory" or "supplies", NOT "other".
 
+CURRENCY DETECTION (CRITICAL):
+- Look for currency SYMBOLS and CODES on the invoice:
+  - "$" alone with a Singapore address/company → "SGD"
+  - "$" alone with a US address → "USD"
+  - "S$" → "SGD"
+  - "₱" or "Php" or "PHP" or "P" (with PH context) → "PHP"
+  - "€" → "EUR"
+  - "£" → "GBP"
+  - "¥" or "JPY" → "JPY"
+  - "RM" → "MYR"
+  - "HK$" → "HKD"
+- If the invoice shows "$" but the vendor/client is in Singapore, assume SGD not USD.
+- NEVER leave currency blank if there are currency symbols on the invoice. Use context clues (vendor country, client country) to disambiguate "$".
+
+YEAR vs AMOUNT CONFUSION (CRITICAL):
+- Text like "November 2025", "October 2025", "FY 2025" contains the YEAR, not an amount.
+- NEVER use 2024, 2025, 2026, or similar year-like numbers as grand_total, net_total, or line item amounts unless they genuinely appear as monetary values (e.g. "Total: 2,025.00" with a currency symbol).
+- Cross-check: if the line items sum to a number like 530 but you extracted 2025 as grand_total, the 2025 is almost certainly a year from a date string, not the total.
+
 Rules:
 - invoice.date must be YYYY-MM-DD (best guess; if unknown, empty string + low confidence).
 - line_items may be [] if not confident.
@@ -307,7 +351,8 @@ async function extractInvoiceWithGemini(ocrText, config, attachment) {
   const parts = [{ text: buildPrompt(ocrText) }];
 
   const mimetype = String(attachment?.mimetype || "").toLowerCase();
-  if (mimetype.startsWith("image/") && attachment?.datas) {
+  const canInline = mimetype.startsWith("image/") || mimetype === "application/pdf";
+  if (canInline && attachment?.datas) {
     parts.push({
       inlineData: { mimeType: mimetype, data: attachment.datas }
     });
@@ -393,7 +438,51 @@ async function assignAccountsWithGemini(extracted, expenseAccounts, config, indu
 
   const industryHint = String(industry || "").trim();
   const industrySection = industryHint
-    ? `\nCOMPANY INDUSTRY: ${industryHint}\nUse industry context to decide COST OF REVENUE vs OPERATING EXPENSE:\n- If the purchase is directly used to produce/deliver the company's core product or service, use Cost of Revenue / Cost of Sales / COGS accounts.\n- If the purchase is for back-office, admin, or support operations, use Operating Expense accounts.\n- Examples by industry:\n  - Restaurant/food: ingredients, condiments, packaging → Cost of Revenue. Cleaning supplies, office supplies → Operating Expense.\n  - Retail/trading: merchandise for resale → Cost of Sales. Store supplies, bags → Cost of Sales. Office supplies → Operating Expense.\n  - Manufacturing: raw materials, factory supplies → Cost of Revenue. Office supplies → Operating Expense.\n  - Services/consulting: subcontractor fees, project materials → Cost of Revenue. Office rent, admin supplies → Operating Expense.\n  - Laundry: detergent, fabric softener → Cost of Revenue. Store signage → Operating Expense.\n  - Construction: cement, lumber, rebar → Cost of Revenue. Office supplies → Operating Expense.\n`
+    ? `
+COMPANY INDUSTRY: ${industryHint}
+
+USE THE INDUSTRY TO GUIDE YOUR ACCOUNT SELECTION. The industry tells you what this company does, which determines how EVERY purchase should be classified — not just COGS vs OpEx.
+
+INDUSTRY-BASED ACCOUNT SELECTION RULES:
+1. WHAT IS THE COMPANY'S CORE BUSINESS? The industry tells you. All purchases related to the core business should go to the most specific matching account.
+2. PURCHASES THAT SERVE THE CORE BUSINESS are more likely to be Inventory, Cost of Sales, COGS, or direct operational accounts — NOT generic admin/expense.
+3. PURCHASES FOR BACK-OFFICE are Operating Expense — but still pick the most specific account (e.g. "Office Supplies" not "Admin Expense").
+4. THE INDUSTRY CHANGES THE DEFAULT ACCOUNT for the same item:
+
+INDUSTRY-SPECIFIC ACCOUNT MAPPING EXAMPLES:
+- Restaurant/food service/hotel/resort:
+  * Food, beverages, ingredients, condiments, meat, seafood, produce → Inventory / Cost of Sales / Food Cost / COGS
+  * Wine, beer, spirits, soft drinks → Inventory - Beverages / Beverage Cost / COGS
+  * Kitchen supplies, packaging, takeout containers → Cost of Sales / Kitchen Supplies
+  * Cleaning supplies, detergent → Operating Supplies / Janitorial (NOT COGS unless for guest rooms)
+  * Linen, towels, uniforms → Operating Supplies / Housekeeping
+  * Gas/LPG for cooking → Cost of Sales / Fuel (kitchen) or Utilities
+
+- Retail/trading/distribution:
+  * Merchandise for resale → Inventory / Cost of Sales / Purchases
+  * Bags, packaging, wrapping → Cost of Sales / Packaging
+  * Store fixtures, displays → Supplies / Store Equipment
+
+- Manufacturing:
+  * Raw materials → Inventory / Raw Materials / Cost of Sales
+  * Factory supplies, machine parts → Manufacturing Overhead / Factory Supplies
+  * Packaging materials → Cost of Sales / Packaging
+
+- Laundry/cleaning services:
+  * Detergent, bleach, fabric softener, chemicals → Cost of Sales / Direct Materials
+  * Hangers, plastic bags → Cost of Sales / Supplies
+
+- Construction:
+  * Cement, lumber, rebar, gravel, sand → Cost of Sales / Construction Materials
+  * Tools, PPE → Construction Supplies
+
+- Professional services/consulting:
+  * Subcontractor fees → Cost of Revenue / Subcontractor Expense
+  * Client-related travel → Cost of Revenue / Travel
+  * Office supplies → Operating Expense / Office Supplies
+
+5. KEY PRINCIPLE: When the company's industry matches the vendor's products, those products are almost certainly for the CORE BUSINESS, not general admin. A restaurant buying from a meat vendor = inventory/COGS, not "Admin Expense". A hotel buying from a wine distributor = beverage inventory, not "Meals & Entertainment".
+`
     : "";
 
   const ocrSection = ocrText
@@ -422,14 +511,15 @@ RULES (MANDATORY - follow ALL):
 
 2. THINK LIKE A PH ACCOUNTANT recording a vendor bill:
    - What did we buy? What account do we debit?
-   - A laundry shop vendor → we paid for laundry services → "Outside Services", "Janitorial & Cleaning", "Laundry Expense", or similar
-   - A fabric/textile vendor → we bought materials → "Supplies", "Raw Materials", "Cost of Sales", or "Inventory" accounts
-   - A gas station → fuel → "Fuel & Oil", "Gas & Oil", "Transportation"
-   - A hardware store → supplies/materials → "Supplies", "Repairs & Maintenance"
-   - A food/restaurant vendor → "Meals & Entertainment", "Representation"
+   - ALWAYS consider the COMPANY INDUSTRY (above) first. The same purchase maps to different accounts depending on what the company does.
+   - A laundry shop vendor → we paid for laundry services → "Outside Services", "Janitorial & Cleaning", or similar. BUT if OUR company IS a laundry business, this could be "Cost of Sales" (subcontractor).
+   - A fabric/textile vendor → "Supplies", "Raw Materials", "Cost of Sales", or "Inventory" accounts
+   - A gas station → fuel → "Fuel & Oil", "Gas & Oil", "Transportation". BUT if the fuel is for cooking (restaurant), consider "Cost of Sales".
+   - A hardware store → "Supplies", "Repairs & Maintenance"
+   - A food/beverage vendor → If our company is in food/hospitality → "Inventory", "Cost of Sales", "COGS". If our company is NOT in food → "Meals & Entertainment".
+   - Beer/wine/spirits vendor → If our company is in food/hospitality/bar → "Inventory - Beverages", "Cost of Sales". If not → "Meals & Entertainment".
    - Printing/stationery → "Office Supplies", "Printing & Stationery"
    - Electricity/water/internet → "Utilities"
-   - Beer/beverages vendor → "Inventory" (asset_current) if for resale, "Meals & Entertainment" if for consumption
 
 3. VENDOR NAME IS YOUR STRONGEST CLUE when the item description is unclear (bad OCR, handwritten, brand name gibberish). A "LAUNDRY SHOP" sells laundry services. A "FABRIC TRADING" sells fabric. A "MARKETING CORPORATION" selling beer is a beer distributor.
 

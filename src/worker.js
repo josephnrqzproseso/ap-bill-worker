@@ -47,11 +47,19 @@ function parseAcctDb(raw) {
   return { target_base_url: bu, target_db: deriveDbFromBaseUrl(bu) };
 }
 
-async function getSourceOdooTargetMap(logger) {
+async function getSourceOdooTargetMap(logger, rows = []) {
   const src = config.odooDefaults;
   if (!src.sourceBaseUrl || !src.sourceDb || !src.sourceLogin || !src.sourcePassword) {
     return null;
   }
+  const projectIds = [
+    ...new Set(
+      rows
+        .map((r) => Number(r.source_project_id || 0))
+        .filter((n) => Number.isFinite(n) && n > 0)
+    )
+  ];
+  if (!projectIds.length) return new Map();
   try {
     const odoo = new OdooClient({
       baseUrl: src.sourceBaseUrl,
@@ -59,52 +67,56 @@ async function getSourceOdooTargetMap(logger) {
       login: src.sourceLogin,
       password: src.sourcePassword
     });
-    const stageName = src.routingStageName || "Master";
-    const taxFilter = src.taxTaskNameFilter || "Tax PH";
-    const taxTasks =
-      (await odoo.searchRead(
-        "project.task",
-        [
-          ["name", "ilike", taxFilter],
-          ["stage_id.name", "=", stageName]
-        ],
-        ["id", "project_id"],
-        { limit: 500, order: "id desc" }
-      )) || [];
-    const projectIds = [
-      ...new Set(
-        taxTasks
-          .map((t) => (Array.isArray(t.project_id) ? t.project_id[0] : null))
-          .filter(Boolean)
-          .map((n) => Number(n))
-          .filter((n) => Number.isFinite(n) && n > 0)
-      )
+    const generalStageName = src.sourceGeneralTaskStageName || "General";
+    const industryField = config.odooDefaults.sourceGeneralTaskIndustryField || "x_studio_industry";
+    const generalTaskDomain = [
+      ["project_id", "in", projectIds],
+      ["name", "=", "General"],
+      ["stage_id.name", "=", generalStageName]
     ];
-    if (!projectIds.length) return new Map();
-    const generalTasks =
-      (await odoo.searchRead(
-        "project.task",
-        [
-          ["project_id", "in", projectIds],
-          ["name", "=", "General"]
-        ],
-        ["id", "project_id", config.odooDefaults.sourceGeneralTaskDbField],
-        { limit: projectIds.length * 5 }
-      )) || [];
+    let generalTasks = [];
+    try {
+      generalTasks =
+        (await odoo.searchRead(
+          "project.task",
+          generalTaskDomain,
+          ["id", "project_id", config.odooDefaults.sourceGeneralTaskDbField, industryField],
+          { limit: projectIds.length * 5 }
+        )) || [];
+    } catch (fieldErr) {
+      if (String(fieldErr?.message || fieldErr).includes("Invalid field")) {
+        generalTasks =
+          (await odoo.searchRead(
+            "project.task",
+            generalTaskDomain,
+            ["id", "project_id", config.odooDefaults.sourceGeneralTaskDbField],
+            { limit: projectIds.length * 5 }
+          )) || [];
+      } else throw fieldErr;
+    }
     const rawDbByProject = new Map();
+    const rawIndustryByProject = new Map();
     for (const t of generalTasks) {
       const pid = Array.isArray(t.project_id) ? Number(t.project_id[0]) : null;
       if (!pid) continue;
       if (!rawDbByProject.has(pid)) {
         rawDbByProject.set(pid, t[config.odooDefaults.sourceGeneralTaskDbField]);
       }
+      if (industryField in t) {
+        const iv = t[industryField];
+        const industry = iv ? (Array.isArray(iv) ? String(iv[1] || iv[0] || "").trim() : String(iv || "").trim()) : "";
+        if (industry && !rawIndustryByProject.has(pid)) rawIndustryByProject.set(pid, industry);
+      }
     }
     const map = new Map();
     for (const pid of projectIds) {
       const parsed = parseAcctDb(rawDbByProject.get(pid));
-      if (parsed.target_base_url) map.set(pid, parsed);
+      const industry = rawIndustryByProject.get(pid) || "";
+      if (parsed.target_base_url || industry) {
+        map.set(pid, { ...parsed, industry });
+      }
     }
-    logger.info("Refreshed target_base_url/target_db from SOURCE General task.", { projects: map.size });
+    logger.info("Refreshed target_base_url/target_db/industry from SOURCE General task.", { projects: map.size, projectIds });
     return map;
   } catch (err) {
     logger.warn("Source Odoo refresh failed (continuing with sheet values).", { error: err?.message || String(err) });
@@ -250,19 +262,56 @@ async function pickVatTaxesForCompany(odoo, companyId) {
 }
 
 async function resolveIndustry(odoo, companyId) {
-  try {
-    const companies = await odoo.searchRead(
-      "res.company",
-      [["id", "=", companyId]],
-      ["id", "x_studio_industry"],
-      { limit: 1 }
-    );
-    const val = companies?.[0]?.x_studio_industry;
-    if (val) {
-      const industry = Array.isArray(val) ? String(val[1] || val[0] || "") : String(val || "");
-      return industry.trim();
-    }
-  } catch (_) {}
+  const fieldSets = [
+    ["x_studio_industry"],
+    ["industry_id"],
+    ["partner_id"]
+  ];
+  for (const fields of fieldSets) {
+    try {
+      const companies = await odoo.searchRead(
+        "res.company",
+        [["id", "=", companyId]],
+        ["id", ...fields],
+        { limit: 1 }
+      );
+      const co = companies?.[0];
+      if (!co) continue;
+
+      if (fields.includes("x_studio_industry")) {
+        const val = co.x_studio_industry;
+        if (val) {
+          const industry = Array.isArray(val) ? String(val[1] || val[0] || "") : String(val || "");
+          if (industry.trim()) return industry.trim();
+        }
+      }
+      if (fields.includes("industry_id")) {
+        const val = co.industry_id;
+        if (val) {
+          const industry = Array.isArray(val) ? String(val[1] || val[0] || "") : String(val || "");
+          if (industry.trim()) return industry.trim();
+        }
+      }
+      if (fields.includes("partner_id")) {
+        const partnerId = Array.isArray(co.partner_id) ? co.partner_id[0] : Number(co.partner_id || 0);
+        if (partnerId) {
+          try {
+            const partners = await odoo.searchRead(
+              "res.partner",
+              [["id", "=", partnerId]],
+              ["id", "industry_id"],
+              { limit: 1 }
+            );
+            const pVal = partners?.[0]?.industry_id;
+            if (pVal) {
+              const industry = Array.isArray(pVal) ? String(pVal[1] || pVal[0] || "") : String(pVal || "");
+              if (industry.trim()) return industry.trim();
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
   return "";
 }
 
@@ -295,7 +344,7 @@ async function resolvePurchaseJournalId(odoo, companyId) {
   return Number((notReceipt || journals[0]).id);
 }
 
-async function refreshRoutingAutoFields(headers, rows, logger) {
+async function refreshRoutingAutoFields(headers, rows, logger, sourceMap = null) {
   ensureAutoColumns(headers, rows);
   const groups = groupRowsByTarget(rows);
   let updated = 0;
@@ -310,10 +359,21 @@ async function refreshRoutingAutoFields(headers, rows, logger) {
       let apFolderId = 0;
       try { apFolderId = await resolveApFolderId(odoo, g.companyId); } catch (_) {}
 
-      let industryVal = "";
-      try { industryVal = await resolveIndustry(odoo, g.companyId); } catch (_) {}
+      let targetIndustryVal = "";
+      try {
+        targetIndustryVal = await resolveIndustry(odoo, g.companyId);
+        logger.info("Industry resolved from TARGET.", { companyId: g.companyId, industry: targetIndustryVal || "(empty)" });
+      } catch (err) {
+        logger.warn("Industry resolve from TARGET failed.", { companyId: g.companyId, error: err?.message || String(err) });
+      }
 
       for (const row of g.rows) {
+        const pid = Number(row.source_project_id || 0);
+        const generalTaskIndustry = sourceMap?.get(pid)?.industry;
+        const industryVal = generalTaskIndustry || targetIndustryVal;
+        if (generalTaskIndustry) {
+          logger.info("Industry from General task.", { projectId: pid, industry: generalTaskIndustry });
+        }
         const before = [
           String(row.vat_purchase_tax_id_goods || "").trim(),
           String(row.vat_purchase_tax_id_services || "").trim(),
@@ -349,7 +409,7 @@ async function refreshRoutingAutoFields(headers, rows, logger) {
 
 async function getRoutingRows(logger) {
   const { headers, rows } = await loadRoutingSheetData(config);
-  const sourceMap = await getSourceOdooTargetMap(logger);
+    const sourceMap = await getSourceOdooTargetMap(logger, rows);
   if (sourceMap && sourceMap.size > 0) {
     for (const row of rows) {
       const pid = Number(row.source_project_id || 0);
@@ -357,11 +417,12 @@ async function getRoutingRows(logger) {
         const r = sourceMap.get(pid);
         if (!normalizeOdooBaseUrl(row.target_base_url)) row.target_base_url = r.target_base_url || row.target_base_url;
         if (!String(row.target_db || "").trim()) row.target_db = r.target_db || row.target_db;
+        if (r.industry && !String(row.industry || "").trim()) row.industry = r.industry;
       }
     }
   }
 
-  const refreshRes = await refreshRoutingAutoFields(headers, rows, logger);
+  const refreshRes = await refreshRoutingAutoFields(headers, rows, logger, sourceMap);
   await saveRoutingSheetData(config, headers, rows);
   logger.info("Refreshed auto-fields into ProjectRouting.", refreshRes);
 
@@ -675,7 +736,15 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
 
 function pickTaxIds(vatIds, extracted) {
   const classification = String(extracted?.vat?.classification || "").toLowerCase();
-  if (classification === "exempt" || classification === "zero_rated" || classification === "unknown") {
+  const lineItems = extracted?.line_items || [];
+  const anyLineVatable = lineItems.some(
+    (li) => String(li.vat_code || "").toLowerCase() === "vatable"
+  );
+
+  if (
+    !anyLineVatable &&
+    (classification === "exempt" || classification === "zero_rated" || classification === "unknown")
+  ) {
     return [];
   }
   const gs = String(extracted?.vat?.goods_or_services || "").toLowerCase();
@@ -744,31 +813,46 @@ async function loadExpenseAccounts(odoo, companyId) {
   if (expenseAccountsCache.has(key)) return expenseAccountsCache.get(key);
 
   let accounts = [];
-  try {
-    accounts = await odoo.searchRead(
-      "account.account",
-      [
-        ["company_id", "=", companyId],
-        ["account_type", "in", ["expense", "expense_direct_cost", "expense_depreciation", "asset_current"]],
-        ["deprecated", "=", false]
-      ],
-      ["id", "code", "name"],
-      kwWithCompany(companyId, { limit: 500, order: "code asc" })
-    );
-  } catch (_) {
+  const errors = [];
+
+  const attempts = [
+    {
+      label: "expense_types",
+      domain: [["account_type", "in", ["expense", "expense_direct_cost", "expense_depreciation", "asset_current"]]]
+    },
+    {
+      label: "expense_basic",
+      domain: [["account_type", "in", ["expense", "expense_direct_cost"]]]
+    },
+    {
+      label: "code_5_or_6",
+      domain: ["|", ["code", "like", "5"], ["code", "like", "6"]]
+    },
+    {
+      label: "all_accounts",
+      domain: []
+    }
+  ];
+
+  for (const attempt of attempts) {
+    if (accounts.length) break;
     try {
       accounts = await odoo.searchRead(
         "account.account",
-        [
-          ["company_id", "=", companyId],
-          ["internal_type", "=", "other"],
-          ["deprecated", "=", false],
-          ["code", "like", "6%"]
-        ],
+        attempt.domain,
         ["id", "code", "name"],
-        kwWithCompany(companyId, { limit: 500, order: "code asc" })
+        kwWithCompany(companyId, { limit: 1000, order: "code asc" })
       );
-    } catch (__) {}
+      if (accounts.length) {
+        errors.push(`OK: ${attempt.label} returned ${accounts.length} accounts`);
+      }
+    } catch (err) {
+      errors.push(`FAIL: ${attempt.label}: ${String(err?.message || err).slice(0, 120)}`);
+    }
+  }
+
+  if (!accounts.length) {
+    errors.push("ALL QUERIES FAILED - 0 accounts loaded");
   }
 
   const result = accounts.map((a) => ({
@@ -776,6 +860,7 @@ async function loadExpenseAccounts(odoo, companyId) {
     code: String(a.code || ""),
     name: String(a.name || "")
   }));
+  result._loadLog = errors;
   expenseAccountsCache.set(key, result);
   return result;
 }
@@ -1020,20 +1105,27 @@ async function resolveExpenseAccountId({
 function adjustPriceForTax(price, invoiceVatInclusive, taxPriceInclude, taxRate) {
   if (!price) return price;
   if (invoiceVatInclusive && !taxPriceInclude) {
-    return Math.round((price / (1 + taxRate / 100)) * 100) / 100;
+    return Math.round((price / (1 + taxRate / 100)) * 1e6) / 1e6;
   }
   if (!invoiceVatInclusive && taxPriceInclude) {
-    return Math.round((price * (1 + taxRate / 100)) * 100) / 100;
+    return Math.round((price * (1 + taxRate / 100)) * 1e6) / 1e6;
   }
   return price;
 }
 
-function lineItemsTotalMatchesInvoice(lineItems, expectedTotal) {
-  if (!lineItems.length || !expectedTotal) return false;
+function lineItemsTotalMatchesInvoice(lineItems, grandTotal, netTotal) {
+  if (!lineItems.length) return false;
   const lineSum = lineItems.reduce((s, li) => s + Number(li.amount || 0), 0);
   if (!lineSum) return false;
-  const diff = Math.abs(lineSum - expectedTotal) / expectedTotal;
-  return diff < 0.05;
+  if (grandTotal > 0) {
+    const diffGrand = Math.abs(lineSum - grandTotal) / grandTotal;
+    if (diffGrand < 0.05) return true;
+  }
+  if (netTotal > 0 && netTotal !== grandTotal) {
+    const diffNet = Math.abs(lineSum - netTotal) / netTotal;
+    if (diffNet < 0.05) return true;
+  }
+  return false;
 }
 
 function extractOcrAmounts(ocrText) {
@@ -1044,36 +1136,113 @@ function extractOcrAmounts(ocrText) {
     .filter((n) => n >= 100 && Number.isFinite(n));
 }
 
+function isTotalLikeLabel(label) {
+  const l = String(label || "").toLowerCase();
+  const excludePatterns = ["line_item", "line item", "unit_price", "unit price", "vat_amount", "vat amount", "tax_amount", "tax amount", "exempt", "zero_rated"];
+  if (excludePatterns.some((p) => l.includes(p))) return false;
+  return l.includes("total") || l.includes("grand") || l.includes("due") || l.includes("amount due") || l.includes("amount_due") || l === "amount";
+}
+
 function fixExtractedAmounts(extracted, ocrText, logger) {
   const totals = extracted?.totals;
   if (!totals) return;
   const grandTotal = Number(totals.grand_total || 0);
   const lineItems = extracted?.line_items || [];
+  const candidates = (extracted?.amount_candidates || [])
+    .map((c) => ({ amount: Number(c.amount || 0), confidence: Number(c.confidence || 0), label: String(c.label || "").toLowerCase() }))
+    .filter((c) => c.amount >= 10);
+  const ocrAmounts = extractOcrAmounts(ocrText);
 
   let correctTotal = 0;
 
   const lineSum = lineItems.reduce((s, li) => s + Number(li.amount || 0), 0);
-  if (lineItems.length >= 1 && lineSum >= 100) {
-    const ratio = lineSum / (grandTotal || 1);
-    if (ratio >= 5 && ratio <= 15) {
+
+  // Case Y: grand_total looks like a year (2020-2030) confused with a monetary amount
+  if (!correctTotal && grandTotal >= 2020 && grandTotal <= 2030 && grandTotal === Math.floor(grandTotal)) {
+    if (lineItems.length >= 1 && lineSum > 0 && Math.abs(lineSum - grandTotal) / grandTotal > 0.1) {
       correctTotal = lineSum;
-      if (logger) logger.info("Amount correction: line item sum >> grand total, using line sum.", {
+      if (logger) logger.info("Amount correction: grand total looks like a year number.", {
+        geminiTotal: grandTotal, lineSum
+      });
+    } else {
+      const totalCand = candidates
+        .filter((c) => isTotalLikeLabel(c.label) && Math.abs(c.amount - grandTotal) / grandTotal > 0.1)
+        .sort((a, b) => b.confidence - a.confidence)[0];
+      if (totalCand) {
+        correctTotal = totalCand.amount;
+        if (logger) logger.info("Amount correction: grand total looks like a year, using candidate.", {
+          geminiTotal: grandTotal, candidateAmount: totalCand.amount, label: totalCand.label
+        });
+      }
+    }
+  }
+
+  // Case A: line sum >> grand total (grand total is too small — missing digits or picked a line item)
+  if (!correctTotal && lineItems.length >= 2 && lineSum >= 100 && grandTotal >= 1) {
+    const ratio = lineSum / grandTotal;
+    if (ratio >= 2 && ratio <= 20) {
+      correctTotal = lineSum;
+      if (logger) logger.info("Amount correction: line sum >> grand total.", {
         geminiTotal: grandTotal, lineSum, ratio: ratio.toFixed(1)
       });
     }
   }
 
-  // Use amount_candidates when Gemini picked a much smaller total (e.g. 1045 vs 10505)
+  // Case B: grand total >> line sum (grand total inflated, e.g. 85509 vs 8017)
+  if (!correctTotal && lineItems.length >= 1 && lineSum >= 100 && grandTotal >= 1) {
+    const ratio = grandTotal / lineSum;
+    if (ratio >= 5 && ratio <= 15) {
+      const bestCandidate = candidates
+        .filter((c) => isTotalLikeLabel(c.label))
+        .sort((a, b) => b.confidence - a.confidence)[0];
+      if (bestCandidate && Math.abs(bestCandidate.amount - lineSum) / lineSum < 2) {
+        correctTotal = bestCandidate.amount;
+      } else {
+        correctTotal = lineSum;
+      }
+      if (logger) logger.info("Amount correction: grand total >> line sum (inflated).", {
+        geminiTotal: grandTotal, lineSum, corrected: correctTotal, ratio: ratio.toFixed(1)
+      });
+    }
+  }
+
+  // Case C: amount_candidate much larger than grand total (grand total truncated or picked a line item)
   if (!correctTotal && grandTotal >= 1) {
-    const candidates = extracted?.amount_candidates || [];
-    const inRange = candidates
-      .map((c) => ({ amount: Number(c.amount || 0), confidence: Number(c.confidence || 0), label: c.label }))
-      .filter((c) => c.amount >= 1);
-    for (const c of inRange) {
+    const totalCands = candidates
+      .filter((c) => isTotalLikeLabel(c.label))
+      .sort((a, b) => b.amount - a.amount);
+    for (const c of totalCands) {
       const ratio = c.amount / grandTotal;
+      if (ratio >= 2 && ratio <= 20 && c.amount > grandTotal) {
+        correctTotal = c.amount;
+        if (logger) logger.info("Amount correction: total-candidate >> grand total.", {
+          geminiTotal: grandTotal, candidateAmount: c.amount, label: c.label, ratio: ratio.toFixed(1)
+        });
+        break;
+      }
+    }
+    if (!correctTotal) {
+      for (const c of candidates) {
+        const ratio = c.amount / grandTotal;
+        if (ratio >= 5 && ratio <= 15) {
+          correctTotal = c.amount;
+          if (logger) logger.info("Amount correction: candidate >> grand total.", {
+            geminiTotal: grandTotal, candidateAmount: c.amount, label: c.label, ratio: ratio.toFixed(1)
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  // Case D: amount_candidate much smaller than grand total (grand total inflated)
+  if (!correctTotal && grandTotal >= 1) {
+    const totalCandidates = candidates.filter((c) => isTotalLikeLabel(c.label));
+    for (const c of totalCandidates) {
+      const ratio = grandTotal / c.amount;
       if (ratio >= 5 && ratio <= 15) {
         correctTotal = c.amount;
-        if (logger) logger.info("Amount correction: using amount_candidate (OCR closer than Gemini total).", {
+        if (logger) logger.info("Amount correction: grand total >> candidate (inflated).", {
           geminiTotal: grandTotal, candidateAmount: c.amount, label: c.label, ratio: ratio.toFixed(1)
         });
         break;
@@ -1081,21 +1250,96 @@ function fixExtractedAmounts(extracted, ocrText, logger) {
     }
   }
 
-  if (!correctTotal) {
-    const ocrAmounts = extractOcrAmounts(ocrText);
-    if (ocrAmounts.length) {
-      const maxOcr = Math.max(...ocrAmounts);
-      if (maxOcr > grandTotal * 1.5) {
-        const ratio = maxOcr / grandTotal;
-        if (ratio >= 5 && ratio <= 15) {
-          const nearMax = ocrAmounts.filter((a) => Math.abs(a - maxOcr) / maxOcr < 0.02);
-          if (nearMax.length >= 1) {
-            correctTotal = maxOcr;
-            if (logger) logger.info("Amount correction: Gemini total appears truncated (from OCR).", {
-              geminiTotal: grandTotal, ocrMax: maxOcr, ratio: ratio.toFixed(1)
-            });
-          }
+  // Case E: OCR max much larger than grand total (grand total truncated)
+  if (!correctTotal && ocrAmounts.length && grandTotal >= 1) {
+    const maxOcr = Math.max(...ocrAmounts);
+    const ratio = maxOcr / grandTotal;
+    if (ratio >= 2 && ratio <= 20) {
+      correctTotal = maxOcr;
+      if (logger) logger.info("Amount correction: OCR max >> grand total.", {
+        geminiTotal: grandTotal, ocrMax: maxOcr, ratio: ratio.toFixed(1)
+      });
+    }
+  }
+
+  // Case F: grand total much larger than ALL OCR amounts (grand total inflated)
+  if (!correctTotal && ocrAmounts.length >= 2 && grandTotal >= 100) {
+    const maxOcr = Math.max(...ocrAmounts);
+    const ratio = grandTotal / maxOcr;
+    if (ratio >= 5 && ratio <= 15) {
+      correctTotal = maxOcr;
+      if (logger) logger.info("Amount correction: grand total >> OCR max (inflated).", {
+        geminiTotal: grandTotal, ocrMax: maxOcr, ratio: ratio.toFixed(1)
+      });
+    }
+  }
+
+  // Case H: grand_total ≈ tax_total or vat_amount (picked VAT component as total)
+  if (!correctTotal && grandTotal >= 1) {
+    const taxTotal = Number(totals.tax_total || 0);
+    const vatAmount = Number(extracted?.vat?.vat_amount || 0);
+    const vatBase = Number(extracted?.vat?.vatable_base || 0);
+    const taxRef = taxTotal || vatAmount;
+
+    if (taxRef > 0 && Math.abs(grandTotal - taxRef) / grandTotal < 0.1) {
+      if (vatBase > 0 && vatBase > taxRef) {
+        correctTotal = vatBase + taxRef;
+      } else {
+        const bigCandidate = candidates
+          .filter((c) => c.amount > grandTotal * 2 && isTotalLikeLabel(c.label))
+          .sort((a, b) => b.confidence - a.confidence)[0];
+        if (bigCandidate) {
+          correctTotal = bigCandidate.amount;
+        } else {
+          correctTotal = Math.round((taxRef / 0.12) * 1.12 * 100) / 100;
         }
+      }
+      if (logger) logger.info("Amount correction: grand_total ≈ tax/vat_amount (picked VAT as total).", {
+        geminiTotal: grandTotal, taxRef, vatBase, corrected: correctTotal
+      });
+    }
+  }
+
+  // Case I: tax_total > grand_total (impossible — tax cannot exceed total)
+  if (!correctTotal && grandTotal >= 1) {
+    const taxTotal = Number(totals.tax_total || 0);
+    if (taxTotal > 0 && taxTotal > grandTotal * 0.20) {
+      const bigCandidates = candidates
+        .filter((c) => c.amount > grandTotal && isTotalLikeLabel(c.label))
+        .sort((a, b) => b.confidence - a.confidence);
+      if (bigCandidates.length) {
+        correctTotal = bigCandidates[0].amount;
+      } else if (lineSum > grandTotal * 1.5) {
+        correctTotal = lineSum;
+      } else {
+        correctTotal = Math.round((taxTotal / 0.12) * 1.12 * 100) / 100;
+      }
+      if (logger) logger.info("Amount correction: tax_total > 20% of grand_total (likely wrong grand total).", {
+        geminiTotal: grandTotal, taxTotal, lineSum, corrected: correctTotal
+      });
+    }
+  }
+
+  // Case G: decimal point misread — grandTotal / 10 or /100 is close to lineSum or a candidate
+  if (!correctTotal && grandTotal >= 1000) {
+    for (const divisor of [10, 100]) {
+      const scaled = grandTotal / divisor;
+      if (lineSum >= 100 && Math.abs(scaled - lineSum) / lineSum < 0.4) {
+        correctTotal = lineSum;
+        if (logger) logger.info("Amount correction: decimal misread (grand total /" + divisor + " ≈ line sum).", {
+          geminiTotal: grandTotal, scaled: scaled.toFixed(2), lineSum
+        });
+        break;
+      }
+      const matchCandidate = candidates.find((c) =>
+        Math.abs(scaled - c.amount) / c.amount < 0.15 && isTotalLikeLabel(c.label)
+      );
+      if (matchCandidate) {
+        correctTotal = matchCandidate.amount;
+        if (logger) logger.info("Amount correction: decimal misread (grand total /" + divisor + " ≈ candidate).", {
+          geminiTotal: grandTotal, scaled: scaled.toFixed(2), candidateAmount: matchCandidate.amount, label: matchCandidate.label
+        });
+        break;
       }
     }
   }
@@ -1103,11 +1347,11 @@ function fixExtractedAmounts(extracted, ocrText, logger) {
   if (correctTotal > 0) {
     totals.grand_total = correctTotal;
     totals.grand_total_confidence = Math.min(totals.grand_total_confidence || 0.5, 0.7);
-    if (totals.net_total && totals.net_total < correctTotal) totals.net_total = correctTotal;
+    if (totals.net_total) totals.net_total = correctTotal;
     if (lineItems.length === 1) {
       const li = lineItems[0];
-      const liAmount = Number(li.amount || 0);
-      if (liAmount < correctTotal && correctTotal / (liAmount || 1) >= 5) {
+      const liAmt = Number(li.amount || 0);
+      if (Math.abs(liAmt - correctTotal) / (correctTotal || 1) > 0.5) {
         li.amount = correctTotal;
         const qty = Number(li.quantity) || 1;
         li.unit_price = qty > 0 ? Math.round((correctTotal / qty) * 100) / 100 : correctTotal;
@@ -1176,32 +1420,81 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
   const ref = String(inv.number || "").trim();
 
   const lineItems = extracted?.line_items || [];
-  const useLineItems = lineItems.length > 0 && lineItemsTotalMatchesInvoice(lineItems, grandTotal || netTotal || 0);
+  const useLineItems = lineItems.length > 0 && lineItemsTotalMatchesInvoice(lineItems, grandTotal, netTotal);
   const hint = extracted?.expense_account_hint || {};
   const invoiceLines = [];
+
+  const expectedUntaxed = hasTax && !taxPriceInclude && grandTotal > 0
+    ? (netTotal > 0 ? netTotal : Math.round((grandTotal / (1 + taxRate / 100)) * 100) / 100)
+    : (grandTotal || netTotal || 0);
+
+  const hasPerLineVat = lineItems.some((li) => li.vat_code);
 
   if (useLineItems) {
     for (let i = 0; i < lineItems.length; i++) {
       const item = lineItems[i];
-      const itemVatInclusive = item.unit_price_includes_vat ?? globalVatInclusive;
+      const lineVatCode = String(item.vat_code || "").toLowerCase();
+
+      let lineHasTax;
+      if (hasPerLineVat && lineVatCode) {
+        lineHasTax = lineVatCode === "vatable" && taxIds.length > 0;
+      } else {
+        lineHasTax = hasTax;
+      }
+
+      const itemVatInclusive = lineHasTax && (globalVatInclusive || (item.unit_price_includes_vat ?? false));
       const rawPrice = Number(item.unit_price || item.amount || 0);
       const line = {
         name: String(item.description || "Line item").slice(0, 256),
         quantity: Number(item.quantity) || 1,
-        price_unit: hasTax ? adjustPriceForTax(rawPrice, itemVatInclusive, taxPriceInclude, taxRate) : rawPrice
+        price_unit: lineHasTax ? adjustPriceForTax(rawPrice, itemVatInclusive, taxPriceInclude, taxRate) : rawPrice
       };
       const acctId = lineAccountIds?.[i] || 0;
       if (acctId) line.account_id = acctId;
-      if (hasTax) line.tax_ids = [[6, 0, taxIds]];
+      if (lineHasTax) line.tax_ids = [[6, 0, taxIds]];
       invoiceLines.push([0, 0, line]);
+    }
+
+    if (!hasPerLineVat && expectedUntaxed > 0 && invoiceLines.length > 0) {
+      const lineUntaxedSum = invoiceLines.reduce((s, entry) => {
+        const l = entry[2];
+        return s + (l.price_unit * l.quantity);
+      }, 0);
+      const diff = expectedUntaxed - lineUntaxedSum;
+      if (Math.abs(diff) > 0.005) {
+        let bestIdx = 0;
+        let bestScore = -Infinity;
+        for (let i = 0; i < invoiceLines.length; i++) {
+          const l = invoiceLines[i][2];
+          const lineTotal = l.price_unit * l.quantity;
+          const perUnitAdj = Math.abs(diff) / (l.quantity || 1);
+          const adjRatio = perUnitAdj / (l.price_unit || 1);
+          const score = lineTotal - adjRatio * 1e6;
+          if (l.quantity === 1 || adjRatio < 0.001) {
+            if (score > bestScore) { bestScore = score; bestIdx = i; }
+          } else if (bestScore === -Infinity) {
+            bestScore = score; bestIdx = i;
+          }
+        }
+        const target = invoiceLines[bestIdx][2];
+        const qty = target.quantity || 1;
+        target.price_unit = Math.round((target.price_unit + diff / qty) * 1e6) / 1e6;
+      }
     }
   } else {
     const singleLineVatInclusive = usedNetTotal ? false : globalVatInclusive;
     const adjustedTotal = hasTax ? adjustPriceForTax(total, singleLineVatInclusive, taxPriceInclude, taxRate) : total;
+    const finalTotal = expectedUntaxed > 0 ? expectedUntaxed : adjustedTotal;
+    const lineDescs = lineItems
+      .map((li) => String(li.description || "").trim())
+      .filter(Boolean);
+    const fallbackLabel = lineDescs.length > 0
+      ? lineDescs.join(", ").slice(0, 256)
+      : "Vendor Bill";
     const line = {
-      name: String(hint.suggested_account_name || "OCR Vendor Bill").slice(0, 256),
+      name: fallbackLabel,
       quantity: 1,
-      price_unit: adjustedTotal
+      price_unit: finalTotal
     };
     const acctId = lineAccountIds?.[0] || 0;
     if (acctId) line.account_id = acctId;
@@ -1283,13 +1576,14 @@ async function linkDocumentToBill(odoo, companyId, docId, billId, logger) {
   if (await documentsDocumentHasField(odoo, "res_id")) linkVals.res_id = Number(billId);
   if (await documentsDocumentHasField(odoo, "account_move_id")) linkVals.account_move_id = Number(billId);
   if (await documentsDocumentHasField(odoo, "invoice_id")) linkVals.invoice_id = Number(billId);
+  if (originalFolderId) linkVals.folder_id = originalFolderId;
 
   if (Object.keys(linkVals).length) {
     await odoo.write("documents.document", [Number(docId)], linkVals);
   }
 
   if (originalFolderId) {
-    const delays = [1500, 2500, 4000];
+    const delays = [800, 1500, 3000, 5000];
     for (let attempt = 0; attempt < delays.length; attempt++) {
       await sleep(delays[attempt]);
       try {
@@ -1458,6 +1752,13 @@ async function processOneDocument(args) {
 
   // --- Account resolution ---
   const expenseAccounts = await loadExpenseAccounts(odoo, companyId);
+  const acctLoadLog = expenseAccounts._loadLog || [];
+  logger.info("Expense accounts loaded.", {
+    docId: doc.id, count: expenseAccounts.length,
+    sample: expenseAccounts.slice(0, 5).map((a) => `${a.code} ${a.name}`),
+    hasNonGeneric: expenseAccounts.some((a) => !isGenericAccount(a)),
+    loadLog: acctLoadLog
+  });
   const accountMapping = await getAccountMapping();
   let geminiAssignments = null;
   try {
@@ -1494,7 +1795,7 @@ async function processOneDocument(args) {
   const hint = extracted?.expense_account_hint || {};
   const grandTotal = Number(extracted?.totals?.grand_total || 0);
   const netTotal = Number(extracted?.totals?.net_total || 0);
-  const useLines = lineItems.length > 0 && lineItemsTotalMatchesInvoice(lineItems, grandTotal || netTotal || 0);
+  const useLines = lineItems.length > 0 && lineItemsTotalMatchesInvoice(lineItems, grandTotal, netTotal);
 
   const lineCount = useLines ? lineItems.length : 1;
   const lineAccountIds = [];
@@ -1591,9 +1892,13 @@ async function processOneDocument(args) {
       const desc = li ? String(li.description || "").slice(0, 60) : "Single line";
       const resolvedSource = lineAccountSources[i] || "";
       const srcLabel = resolvedSource ? ` <i>(${resolvedSource})</i>` : "";
-      lines.push(`Line ${i + 1}: ${desc} → ${acct ? `<b>${acct.code} ${acct.name}</b>${srcLabel}` : `(account #${acctId || "default"})`}`);
+      lines.push(`Line ${i + 1}: ${desc} → ${acct ? `<b>${acct.code} ${acct.name}</b>${srcLabel}` : `(account #${acctId || "default"}) <i>(${resolvedSource || "no accounts loaded"})</i>`}`);
     }
-    const acctMsg = [`<b>💡 Account suggestions</b>`, ...lines].join("<br/>");
+    const geminiInfo = geminiAssignments
+      ? `Gemini: bill_level=${geminiAssignments.bill_level_account_code || "?"} ${geminiAssignments.bill_level_account_name || "?"}`
+      : "Gemini Pass 2: null";
+    const loadStatus = acctLoadLog.length ? acctLoadLog.join("; ") : "no log";
+    const acctMsg = [`<b>💡 Account suggestions</b> <i>(${expenseAccounts.length} accounts loaded)</i>`, `<i>${loadStatus}</i>`, geminiInfo, ...lines].join("<br/>");
     await safeMessagePost(odoo, companyId, "account.move", Number(billId), acctMsg);
   }
 
@@ -1685,6 +1990,7 @@ async function processTargetGroup(target, startMs, logger) {
 }
 
 async function runOne({ logger, payload = {} }) {
+  const timeStart = new Date().toISOString();
   clearPerRunCaches();
   const routingRows = await getRoutingRows(logger);
   const targets = groupRoutingRows(routingRows);
@@ -1790,6 +2096,8 @@ async function runOne({ logger, payload = {} }) {
   return {
     ok: true,
     mode: "run-one",
+    time_start: timeStart,
+    time_completed: new Date().toISOString(),
     targetKey: target.targetKey,
     doc: {
       id: Number(doc.id),
@@ -1854,6 +2162,7 @@ function clearPerRunCaches() {
 
 async function runWorker({ logger }) {
   clearPerRunCaches();
+  const timeStart = new Date().toISOString();
   const startMs = Date.now();
   const routingRows = await getRoutingRows(logger);
   const targets = groupRoutingRows(routingRows);
@@ -1893,6 +2202,8 @@ async function runWorker({ logger }) {
 
   return {
     ok: true,
+    time_start: timeStart,
+    time_completed: new Date().toISOString(),
     elapsedMs: Date.now() - startMs,
     totals,
     targets: targetStats
