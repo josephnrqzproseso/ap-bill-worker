@@ -49,7 +49,8 @@ function toRoutingRowStrict(row) {
     purchase_journal_id: toNumber(row.purchase_journal_id, 0),
     vat_purchase_tax_id_goods: toNumber(row.vat_purchase_tax_id_goods, 0),
     vat_purchase_tax_id_services: toNumber(row.vat_purchase_tax_id_services, 0),
-    vat_purchase_tax_id_generic: toNumber(row.vat_purchase_tax_id_generic, 0)
+    vat_purchase_tax_id_generic: toNumber(row.vat_purchase_tax_id_generic, 0),
+    industry: String(row.industry || "").trim()
   };
 }
 
@@ -76,7 +77,7 @@ function indexToColLetter(idx) {
 async function saveRoutingSheetData(config, headers, rows) {
   const vatCols = [
     "vat_purchase_tax_id_goods", "vat_purchase_tax_id_services", "vat_purchase_tax_id_generic",
-    "purchase_journal_id", "ap_folder_id"
+    "purchase_journal_id", "ap_folder_id", "industry"
   ];
   const sheets = await getSheetsClient();
   const baseRange = config.routing.routingSheetName;
@@ -105,10 +106,36 @@ async function loadRoutingRows(config) {
   return raw.map(toRoutingRowStrict).filter(Boolean);
 }
 
+async function loadAccountMapping(config) {
+  const sheetName = config.routing.accountMappingSheetName;
+  if (!sheetName || !config.routing.spreadsheetId) return [];
+  try {
+    const range = `${sheetName}!A:ZZ`;
+    const values = await readSheetValues(config.routing.spreadsheetId, range);
+    if (!values.length) return [];
+    const [headerRow, ...dataRows] = values;
+    const headers = headerRow.map((h) => String(h || "").trim().toLowerCase());
+    const rows = dataRows.map((r) => rowToObject(headers, r));
+    return rows
+      .filter((r) => r.category && r.account_id)
+      .map((r) => ({
+        targetDb: String(r.target_db || "").trim().toLowerCase(),
+        companyId: toNumber(r.company_id, 0),
+        category: String(r.category || "").trim().toLowerCase(),
+        accountId: toNumber(r.account_id, 0),
+        accountName: String(r.account_name || "").trim()
+      }))
+      .filter((r) => r.accountId && (r.companyId || r.targetDb));
+  } catch (_err) {
+    return [];
+  }
+}
+
 module.exports = {
   loadRoutingRows,
   loadRawRoutingRows,
   loadRoutingSheetData,
   saveRoutingSheetData,
-  toRoutingRowStrict
+  toRoutingRowStrict,
+  loadAccountMapping
 };

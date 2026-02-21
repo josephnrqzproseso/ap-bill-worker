@@ -48,6 +48,8 @@ function asDateIsoToday() {
 
 module.exports = {
   normalizeOdooBaseUrl,
+  deriveDbFromBaseUrl,
+  isFalsyOdooValue,
   m2oId,
   sleep,
   safeJsonParse,

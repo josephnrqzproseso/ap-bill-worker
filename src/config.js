@@ -67,6 +67,8 @@ const config = {
     sourcePassword: process.env.SOURCE_PASSWORD || "",
     defaultExpenseAccountId: toInt(process.env.DEFAULT_EXPENSE_ACCOUNT_ID, 0),
     sourceGeneralTaskDbField: process.env.SOURCE_GENERAL_TASK_DB_FIELD || "x_studio_accounting_database",
+    sourceGeneralTaskIndustryField: process.env.SOURCE_GENERAL_TASK_INDUSTRY_FIELD || "x_studio_industry",
+    sourceGeneralTaskStageName: process.env.SOURCE_GENERAL_TASK_STAGE_NAME || "General",
     routingStageName: process.env.ROUTING_STAGE_NAME || "Master",
     taxTaskNameFilter: process.env.TAX_TASK_NAME_FILTER || "Tax PH"
   },

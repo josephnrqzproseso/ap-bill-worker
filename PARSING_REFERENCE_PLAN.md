@@ -1,6 +1,6 @@
 # AP Bill Worker – Gemini Parameters & Parsing Logic Reference
 
-Reference for Gemini parameters, extraction schemas, and all parsing logic used in this project.
+Reference for Gemini parameters, extraction schemas, and all parsing logic used in this project. **Assumes Odoo 19.**
 
 ---
 
@@ -9,7 +9,7 @@ Reference for Gemini parameters, extraction schemas, and all parsing logic used 
 | Env Variable | Default | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | *(required)* | Google AI API key |
-| `GEMINI_MODEL` | `gemini-3.1-pro-preview` | Primary model for both passes |
+| `GEMINI_MODEL` | `gemini-3-pro-preview` | Primary model for both passes |
 | `GEMINI_FALLBACK_MODEL` | `gemini-2.5-pro` | Stable fallback if primary fails |
 
 Both passes use **structured JSON output** (`responseMimeType: "application/json"` + `responseSchema`).
@@ -20,7 +20,7 @@ Both passes use **structured JSON output** (`responseMimeType: "application/json
 
 **Function**: `extractInvoiceWithGemini(ocrText, config, attachment)`
 
-**Input**: OCR text + optional image bytes (for multi-modal accuracy).
+**Input**: OCR text + **image or PDF bytes** (for multi-modal accuracy). Both `image/*` and `application/pdf` mimetypes are sent to Gemini as inline data so the model can read the document visually. PDFs were previously OCR-only; now the raw PDF is sent for better extraction.
 
 **Output schema** – all fields below are extracted in a single Gemini call:
 
@@ -96,39 +96,59 @@ Array of extracted line items:
 | `quantity` | number | Qty |
 | `unit_price` | number | Price per unit |
 | `amount` | number | Line total |
-| `unit_price_includes_vat` | boolean | Whether unit price is VAT-inclusive |
+| `unit_price_includes_vat` | boolean | Whether unit price is VAT-inclusive (overridden by global `amounts_are_vat_inclusive` when true) |
 | `expense_category` | string | One of: `office_supplies`, `meals`, `repairs`, `rent`, `fuel`, `professional_fees`, `freight`, `utilities`, `inventory`, `other` |
 
 ### expense_account_hint
 | Field | Type | Description |
 |---|---|---|
-| `category` | string | Best-fit category (same options as line_items) |
+| `category` | string | Best-fit category: `office_supplies`, `meals`, `repairs`, `rent`, `fuel`, `professional_fees`, `freight`, `other` (subset of line_items; no utilities, inventory) |
 | `suggested_account_name` | string | Human-friendly account name guess |
 | `confidence` | number | 0–1 |
 | `evidence` | string | Supporting snippet |
 
 ### amount_candidates
-Array of all notable amounts found, each with `label`, `amount`, `confidence`, `snippet`.
+Array of all notable amounts found, each with `label`, `amount`, `confidence`, `snippet`. Used by `fixExtractedAmounts`.
 
 ### warnings
 Array of strings flagging potential issues (e.g. "Multiple totals found", "Low confidence vendor match").
+
+### Amount Correction (`fixExtractedAmounts`)
+
+Post-processing corrects Gemini misreads for handwritten/low-quality receipts:
+
+| Case | When | Action |
+|---|---|---|
+| A | Line sum >> grand total (e.g. 10500 vs 1045) | Use line sum |
+| B | Grand total >> line sum (e.g. 85509 vs 8017) | Use line sum or best amount_candidate |
+| C | Amount candidate >> grand total (truncated) | Use candidate |
+| D | Grand total >> amount candidate (inflated) | Use candidate |
+| E | OCR max >> grand total (truncated) | Use OCR max |
+| F | Grand total >> OCR max (inflated) | Use OCR max |
+| G | Decimal misread (grandTotal/10 or /100 ≈ line sum) | Use line sum or candidate |
+| H | grand_total ≈ tax_total or vat_amount (VAT picked as total) | Use vatable_base + tax, or best "total" candidate, or derive from 12% |
+| I | tax_total > 20% of grand_total (impossible for PH 12% VAT) | Use best total candidate, line sum, or derive from tax / 0.12 × 1.12 |
 
 ### PH-Specific Prompt Rules
 
 - **ATP/Printer box exclusion**: Names found near "ATP", "BIR Permit", "Printer", "Accreditation" are excluded as vendor candidates.
 - **VAT-inclusive detection**: Most PH receipts show prices including 12% VAT. The prompt instructs Gemini to detect this and compute `net_total = grand_total / 1.12`.
-- **Sole proprietor detection**: Gemini is instructed to look for "Prop.", "Owner", or personal names near trade names to distinguish sole proprietors from corporations.
+- **Grand total vs line items**: When totals disagree, prefer the reading where arithmetic is consistent. Never pick a grand total 5x–15x the line item sum (likely misread).
+- **VAT vs total (critical)**: grand_total must NEVER be a VAT/tax component. "VAT Amount: 428.57" means the tax is 428.57, NOT the total. If grand_total ≈ tax_total, the wrong number was picked. If tax_total > grand_total, the grand_total is wrong (tax cannot exceed total).
+- **Extract ALL line items**: Do not skip items. If the invoice lists 10 products, extract all 10. Re-examine if only one line item was found but the document clearly has more.
+- **Sole proprietor detection**: Gemini looks for "Prop.", "Owner", or personal names near trade names.
 
 ---
 
 ## Pass 2: Account Assignment
 
-**Function**: `assignAccountsWithGemini(extracted, expenseAccounts, config, industry)`
+**Function**: `assignAccountsWithGemini(extracted, expenseAccounts, config, industry, ocrText)`
 
 **Input**:
 - Extracted data from Pass 1
-- Full chart of expense accounts from Odoo (`account.account` where `account_type in [expense, expense_direct_cost]`)
-- Company industry (auto-resolved from `res.company.x_studio_industry`)
+- Full chart of expense accounts from Odoo (`account.account` where `account_type in [expense, expense_direct_cost, expense_depreciation, asset_current]`)
+- Company industry (see [Industry Resolution](#industry-resolution))
+- OCR text (for additional context)
 
 **Output schema**:
 
@@ -137,16 +157,28 @@ Array of strings flagging potential issues (e.g. "Multiple totals found", "Low c
 | `assignments` | array | Per-line account picks |
 | `assignments[].line_index` | number | 0-based index into line_items |
 | `assignments[].account_id` | number | Matched Odoo account ID |
+| `assignments[].account_code` | string | Account code |
+| `assignments[].account_name` | string | Account name |
 | `assignments[].confidence` | number | 0–1 |
 | `assignments[].reasoning` | string | Why this account was chosen |
+| `assignments[].alternatives` | array | Fallback account picks |
 | `bill_level_account_id` | number | Best single account for the whole bill |
+| `bill_level_account_code` | string | Account code |
+| `bill_level_account_name` | string | Account name |
 | `bill_level_confidence` | number | 0–1 |
+
+### Industry in Account Selection
+
+When `industry` is non-empty, the prompt includes company industry and industry-specific mapping rules. Full prompt covers:
+- **Core principle**: Purchases for the core business → Cost of Revenue / COGS; back-office → Operating Expense
+- **Industry-specific examples**: Restaurant (ingredients→COGS, kitchen supplies→COGS, cleaning→Janitorial), Retail (merchandise→COGS, packaging→COGS), Manufacturing (raw materials→COGS, factory supplies→Overhead), Laundry (detergent→COGS), Construction (cement, lumber→COGS), Professional services (subcontractors→Cost of Revenue)
 
 ### Prompt Rules
 
 1. **Specificity over generality**: NEVER pick "Admin Expense", "Miscellaneous", "General Expense" unless no specific account exists.
 2. **Match by item description, not vendor**: What was bought matters, not who sold it.
-3. **Industry-aware COGS vs OpEx**: If company industry is known, items directly used in production go to Cost of Revenue; back-office items go to Operating Expense.
+3. **Industry-aware COGS vs OpEx**: When industry is known, use it to decide Cost of Revenue vs Operating Expense.
+4. **Philippine accountant persona**: Think like a PH accountant recording a vendor bill.
 
 ### Item-to-Account Examples (in prompt)
 
@@ -157,40 +189,46 @@ Array of strings flagging potential issues (e.g. "Multiple totals found", "Low c
 | BOND PAPER A4 | Office Supplies / Stationery |
 | TONER CARTRIDGE | Office Supplies / Printing |
 | ELECTRICITY BILL | Utilities / Power & Light |
-| WATER BILL | Utilities / Water |
-| INTERNET | Communication / Telecom |
 | JANITORIAL SUPPLIES | Janitorial / Cleaning Supplies |
 | FOOD / MEALS | Meals & Entertainment |
 | LEGAL FEES | Professional Fees |
 | SHIPPING / DELIVERY | Freight / Shipping |
-| RENT / LEASE | Rent Expense |
-| GASOLINE / DIESEL | Fuel & Oil / Transportation |
-| COURIER / GRAB | Freight / Delivery |
-| PACKAGING / BOXES | Packaging Supplies (or COGS) |
 | FABRIC / CLOTH | Raw Materials (or COGS for mfg) |
 | DETERGENT / BLEACH | Janitorial (or COGS for laundry) |
-| UNIFORM / WORKWEAR | Uniforms / Employee Benefits |
 
-### Industry-Based COGS vs OpEx Examples
+---
 
-| Industry | COGS Items | OpEx Items |
-|---|---|---|
-| Restaurant/food | Ingredients, condiments, packaging | Cleaning supplies, office supplies |
-| Retail/trading | Merchandise, store supplies, bags | Office supplies |
-| Manufacturing | Raw materials, factory supplies | Office supplies |
-| Services/consulting | Subcontractor fees, project materials | Office rent, admin supplies |
-| Laundry | Detergent, fabric softener | Store signage |
-| Construction | Cement, lumber, rebar | Office supplies |
+## Industry Resolution
 
-### Confidence Scale
+**Sources** (checked in order):
 
-| Score | Meaning |
-|---|---|
-| 0.9–1.0 | Account name directly matches item |
-| 0.7–0.9 | Clearly the right category |
-| 0.5–0.7 | Reasonable guess, multiple could fit |
-| 0.3–0.5 | Generic fallback |
-| < 0.3 | Wild guess |
+1. **SOURCE Odoo – General task**  
+   - Project IDs from routing sheet `source_project_id`
+   - Task: name = "General", stage = "General"  
+   - Field: `x_studio_industry` (or `SOURCE_GENERAL_TASK_INDUSTRY_FIELD`)
+   - Requires: `SOURCE_BASE_URL`, `SOURCE_DB`, `SOURCE_LOGIN`, `SOURCE_PASSWORD` (Secret Manager)
+
+2. **TARGET Odoo**  
+   - `res.company.x_studio_industry`  
+   - `res.company.industry_id`  
+   - `res.partner.industry_id` (via company’s partner)
+
+Industry is written to the routing sheet `industry` column and passed to `assignAccountsWithGemini` for account selection.
+
+---
+
+## Expense Account Loading (Odoo 19)
+
+**Function**: `loadExpenseAccounts(odoo, companyId)`
+
+**Query strategy** (cascading, no `company_id` filter on `account.account`):
+
+1. `account_type in [expense, expense_direct_cost, expense_depreciation, asset_current]`
+2. `account_type in [expense, expense_direct_cost]`
+3. `code like "5" OR code like "6"`
+4. All accounts
+
+Each attempt is logged. Company scoping via `kwWithCompany(companyId)` context.
 
 ---
 
@@ -209,19 +247,19 @@ All searches: `name ilike <value>` + `supplier_rank > 0`.
 **Conditions**:
 - Vendor confidence >= 0.9
 - Not an ATP/printer vendor
-- No existing match found (searches by name, trade name, and proprietor name)
+- No existing match found
 
 **Sole proprietor handling**:
-- If `entity_type` is `sole_proprietor` or `individual` AND `proprietor_name` is present → Odoo vendor is created with the **proprietor's personal name** (not the trade name)
+- If `entity_type` is `sole_proprietor` or `individual` AND `proprietor_name` is present → Odoo vendor created with **proprietor's personal name**
 - Trade name goes into `comment` field
-- Sets `company_type: "person"` (falls back to `is_company: false` if field doesn't exist)
+- Sets `company_type: "person"` (falls back to `is_company: false`)
 
 **Corporation handling**:
-- Vendor created with the business name
+- Vendor created with business name
 - Sets `company_type: "company"`
 
 **Fields written**:
-- `name`, `supplier_rank: 1`, `street` (from address), `vat` (from TIN), `comment` (trade name / proprietor notes)
+- `name`, `supplier_rank: 1`, `street`, `vat`, `comment`
 
 ---
 
@@ -230,7 +268,7 @@ All searches: `name ilike <value>` + `supplier_rank > 0`.
 ### Tax ID Selection (`pickTaxIds`)
 
 Based on `vat.classification` from Gemini:
-- `exempt`, `zero_rated`, `unknown` → **no tax IDs** (empty array)
+- `exempt`, `zero_rated`, `unknown` → **no tax IDs**
 - `vatable` → picks tax IDs from routing config based on `goods_or_services`
 
 Tax ID sources (from routing sheet, auto-resolved from Odoo):
@@ -240,17 +278,15 @@ Tax ID sources (from routing sheet, auto-resolved from Odoo):
 
 ### Tax Auto-Resolution (`pickVatTaxesForCompany`)
 
-Queries `account.tax` where `type_tax_use = purchase` and 10% < amount < 14% (targets 12% PH VAT).
+Queries `account.tax` where `type_tax_use = purchase`, 12% VAT.
 
-**Filters out**:
-- Capital goods taxes (names containing "capital", "asset")
-- Only picks regular goods/services/generic VAT
+**Filters out**: Capital goods taxes, withholding taxes, import taxes.
+
+**Prefers**: `price_include = false` (adds VAT on top).
 
 ### Tax Metadata (`getTaxMeta`)
 
-Reads from Odoo for the selected tax ID:
-- `price_include` – whether Odoo expects VAT-inclusive prices
-- `amount` – the tax rate percentage
+Reads from Odoo: `price_include`, `amount` (rate %).
 
 ---
 
@@ -258,61 +294,59 @@ Reads from Odoo for the selected tax ID:
 
 **Function**: `adjustPriceForTax(price, invoiceVatInclusive, taxPriceInclude, taxRate)`
 
-Handles the mismatch between what the invoice shows and what Odoo expects:
-
 | Invoice Price | Odoo Tax Config | Action |
 |---|---|---|
-| VAT-inclusive | `price_include = true` | No adjustment (pass-through) |
+| VAT-inclusive | `price_include = true` | No adjustment |
 | VAT-inclusive | `price_include = false` | Divide by `(1 + rate/100)` to get net |
-| VAT-exclusive | `price_include = true` | Multiply by `(1 + rate/100)` to get gross |
-| VAT-exclusive | `price_include = false` | No adjustment (pass-through) |
+| VAT-exclusive | `price_include = true` | Multiply by `(1 + rate/100)` |
+| VAT-exclusive | `price_include = false` | No adjustment |
+
+**Multi-line VAT logic**: When `amounts_are_vat_inclusive` is true, **all** line unit prices are treated as VAT-inclusive (`globalVatInclusive` overrides per-line `unit_price_includes_vat`). This avoids double VAT when Gemini mistakenly sets per-line to false.
 
 ---
 
-## Currency Resolution
+## Total Reconciliation (Grand Total Prevails)
 
-**Function**: `resolveCurrencyId(odoo, companyId, currencyCode)`
+**Function**: `buildBillVals` – ensures Odoo bill total matches extracted grand total.
 
-- If Gemini extracts a currency (e.g. "USD", "PHP"), searches `res.currency` in Odoo
-- Returns the Odoo `currency_id` to set on the bill
-- Returns 0 (Odoo default) if not found or empty
+1. **Expected untaxed**: `net_total` from extraction, or `grand_total / 1.12` if not provided.
+2. **Multi-line path**: After building line items, sum their untaxed amounts. If diff from `expectedUntaxed` > 0.005 and < 15%, adjust the **last line’s `price_unit`** to close the gap.
+3. **Single-line path**: Use `expectedUntaxed` directly as `price_unit`.
+
+Result: Odoo total = expected untaxed × 1.12 ≈ grand total.
 
 ---
 
 ## Expense Account Cascade
 
-**Function**: `resolveExpenseAccountId(...)` – 5-tier resolution:
+**Function**: `resolveExpenseAccountId(...)` – 8-tier resolution:
 
 ### Tier 1: Vendor Default
-Read `property_account_expense_id` from the matched `res.partner`.
-If set, use it immediately.
+Read `property_account_expense_id` from matched `res.partner`. **Skip if that account is generic** (e.g. Admin Expense).
 
 ### Tier 2: Gemini Pass 2
-Use the `account_id` from `assignAccountsWithGemini` output.
-Validated against the real chart of accounts (must exist in `loadExpenseAccounts` result).
+Use `account_id` from `assignAccountsWithGemini`. Validated and anti-generic (prefer non-generic alternatives).
 
-### Tier 3: Sheet Mapping (AccountMapping tab)
-Lookup in the `AccountMapping` Google Sheet by `category` + `company_id` + `target_db`.
-Falls back to company-only match, then global default.
+### Tier 3: Vendor Name Keywords
+Match vendor name (e.g. "FABRIC TRADING") against account names.
 
-**AccountMapping columns**: `target_db`, `company_id`, `category`, `account_id`, `account_name`
+### Tier 4: Sheet Mapping (AccountMapping tab)
+Lookup by `category` + `company_id` + `target_db`.
 
-### Tier 4: Fuzzy Name Match
-Matches the line item description and category keywords against account names in the chart of accounts.
+### Tier 5: Fuzzy Name Match
+Match line description + category keywords against account names. Penalizes generic accounts.
 
-**Scoring**:
-- Each matching token scores by length (specific words) or 1 point (generic words)
-- Generic words penalized: "expense", "admin", "general", "miscellaneous", "other", "sundry"
-- Accounts where >50% of name is generic get a 60% score penalty
-- Minimum score of 4 required
+### Tier 6: Gemini Last Resort
+Use Gemini's primary pick even if generic (better than Odoo default).
 
-**Category keyword boost**: Each category has associated keywords (e.g. `fuel` → "fuel", "gas", "oil", "lpg", "diesel", "petroleum", "gasoline", "petrol") that are added to the search tokens.
+### Tier 7: Keyword Last Resort
+Best non-generic account matching description/category/vendor keywords; else first non-generic; else first available.
 
-### Tier 5: Environment Fallback
-Uses `DEFAULT_EXPENSE_ACCOUNT_ID` from environment variables.
+### Tier 8: Env Fallback
+`DEFAULT_EXPENSE_ACCOUNT_ID` from environment.
 
-### Tier 6: None
-Returns `accountId: 0` – Odoo will use its own default.
+### Tier 9: None
+Returns `accountId: 0` – Odoo uses its own default.
 
 ---
 
@@ -322,31 +356,18 @@ Returns `accountId: 0` – Odoo will use its own default.
 
 ### Line Items vs Single Line
 
-- If extracted `line_items` exist AND their total is within 5% of the invoice total → use **itemized lines**
-- Otherwise → create a **single summary line**
-
-### Bill Values
-
-| Odoo Field | Source |
-|---|---|
-| `move_type` | Always `"in_invoice"` (vendor bill) |
-| `partner_id` | Matched/created vendor ID |
-| `company_id` | From routing config |
-| `journal_id` | Auto-resolved purchase journal (prefers "Vendor Bills" journal) |
-| `currency_id` | From Gemini currency extraction |
-| `ref` | Invoice number from Gemini |
-| `invoice_date` | Invoice date from Gemini |
-| `invoice_line_ids` | Computed lines with tax, account, price adjustment |
+- If extracted `line_items` exist AND their total is within 5% of invoice total → **itemized lines**
+- Otherwise → **single summary line**
 
 ### Per-Line Fields
 
 | Field | Source |
 |---|---|
-| `name` | Line item description (max 256 chars) |
+| `name` | **Itemized**: line item description (max 256 chars). **Single-line fallback**: extracted line item descriptions joined (if any); else `"Vendor Bill"`. Never uses `expense_account_hint.suggested_account_name` as the line label. |
 | `quantity` | From extraction |
-| `price_unit` | Adjusted via `adjustPriceForTax()` |
+| `price_unit` | Adjusted via `adjustPriceForTax()`; last line may be tweaked for total reconciliation |
 | `account_id` | From expense account cascade |
-| `tax_ids` | `[[6, 0, taxIds]]` (Odoo many2many write format) |
+| `tax_ids` | `[[6, 0, taxIds]]` |
 
 ---
 
@@ -355,51 +376,39 @@ Returns `accountId: 0` – Odoo will use its own default.
 **Function**: `linkDocumentToBill(odoo, companyId, docId, billId, logger)`
 
 1. Reads original `folder_id` from the document
-2. Sets `res_model = "account.move"` and `res_id = billId` (creates Odoo smart button)
-3. Sets `account_move_id` / `invoice_id` if those fields exist
-4. **Explicitly preserves `folder_id`** – if Odoo automation moves the document, it's restored
+2. Sets `res_model = "account.move"`, `res_id = billId`, `account_move_id`, `invoice_id`
+3. **Includes `folder_id` in the same write** to try to prevent Odoo from moving the document
+4. **Retry logic** (800, 1500, 3000, 5000 ms): if folder was moved, restore it
 5. Posts a clickable link to the document in the bill's chatter
 
-**File attachment**: `attachFileToBillChatter` posts the original file as a **chatter attachment** (via `message_post` with `attachment_ids`), NOT as a direct `ir.attachment` on the bill. This prevents Odoo from creating a duplicate document in the "Purchases" folder.
+### Chatter Messages
 
-### Chatter Messages Posted to Bill
-
-1. Source document link
-2. Vendor extraction details (name, confidence, entity type, TIN, address, trade name, proprietor)
-3. Account suggestions per line (code + name)
-4. Extracted amounts (grand total, net total, tax, VAT-inclusive flag, currency)
-5. Warnings (if vendor confidence < 0.9 or extraction warnings present)
+Posted with `body_is_html: true` (Odoo 19). Messages include:
+- Source document link
+- Vendor extraction details
+- Account suggestions per line (code, name, resolution tier)
+- Extracted amounts (grand total, net total, tax, VAT-inclusive flag)
+- Warnings (if vendor confidence < 0.9 or extraction warnings)
 
 ---
 
 ## Reprocessing (Deleted Bills)
 
-### How It Works
-
-Each processed document has a **marker** written to `ir.attachment.description`:
+### Marker Format
 ```
 BILL_OCR_PROCESSED|V1|<target_key>|doc:<doc_id>|bill:<bill_id>|...
 ```
 
 ### Reprocess Flow
 
-1. `processOneDocument` reads the marker and extracts the `bill_id`
-2. Checks if that bill still exists in Odoo (`account.move` search)
-3. If **bill was deleted**: clears the marker from the attachment, then reprocesses from scratch
-4. If **bill exists**: skips (already processed)
+1. Read marker from `ir.attachment.description`
+2. If bill was **deleted**: clear marker, reprocess from scratch
+3. If bill exists: skip
+4. **Payload**: `reprocess: true` or `force_reprocess: true` bypasses duplicate check and forces full reprocess (clears marker first)
 
-### `runOne` Stale Link Cleanup
+### `run-one` Stale Link Cleanup
 
-When calling `/run-one` with a `doc_id` whose linked bill was deleted:
-1. Tries to find the document (with fallback to broader search + archived docs)
-2. If `res_model` points to a deleted `account.move`, clears `res_model`, `res_id`, `account_move_id`, `invoice_id`
-3. Proceeds with normal processing
-
-### Batch `/run` Revisit
-
-The batch run processes documents in two phases:
-1. **New docs** (ID > last checkpoint) – normal forward processing
-2. **Revisit older docs** (ID <= checkpoint) – checks if linked bills still exist, reprocesses if deleted
+When document’s `res_model` points to a deleted `account.move`: clears `res_model`, `res_id`, `account_move_id`, `invoice_id`, then reprocesses.
 
 ---
 
@@ -407,37 +416,25 @@ The batch run processes documents in two phases:
 
 **Function**: `geminiWithRetryAndFallback(config, body, options)`
 
-### Strategy
-
 1. Try **primary model** (`GEMINI_MODEL`)
-2. On HTTP 429/500/503: retry up to **2 times** with backoff (3s, 6s)
-3. If primary exhausted: try **fallback model** (`GEMINI_FALLBACK_MODEL`) with same retry logic
-4. Pass 1 (`extractInvoiceWithGemini`): throws on total failure
-5. Pass 2 (`assignAccountsWithGemini`): returns `null` on failure (cascade continues without Gemini)
-
-### Retryable Status Codes
-
-| Code | Meaning |
-|---|---|
-| 429 | Rate limited |
-| 500 | Server error |
-| 503 | High demand / overloaded |
-
-Non-retryable errors (400, 401, 403, 404) fail immediately without retry.
+2. On HTTP 429/500/503: retry up to 2 times with backoff (3s, 6s)
+3. If primary exhausted: try **fallback model** (`GEMINI_FALLBACK_MODEL`)
+4. Pass 1: throws on total failure
+5. Pass 2: returns `null` on failure (cascade continues without Gemini)
 
 ---
 
 ## Auto-Resolved Routing Fields
 
-These fields in the ProjectRouting sheet are **auto-populated** from Odoo on each run:
+These columns in the ProjectRouting sheet are **auto-populated** on each run:
 
-| Column | Source | Odoo Model/Field |
-|---|---|---|
-| `vat_purchase_tax_id_goods` | 12% VAT for goods | `account.tax` |
-| `vat_purchase_tax_id_services` | 12% VAT for services | `account.tax` |
-| `vat_purchase_tax_id_generic` | Generic 12% VAT | `account.tax` |
-| `purchase_journal_id` | "Vendor Bills" journal | `account.journal` (type=purchase) |
-| `ap_folder_id` | AP folder in Documents | `documents.folder` |
-| `industry` | Company industry | `res.company.x_studio_industry` |
+| Column | Source |
+|---|---|
+| `vat_purchase_tax_id_goods` | 12% VAT for goods (`account.tax`) |
+| `vat_purchase_tax_id_services` | 12% VAT for services |
+| `vat_purchase_tax_id_generic` | Generic 12% VAT |
+| `purchase_journal_id` | "Vendor Bills" journal (`account.journal`) |
+| `ap_folder_id` | AP folder: `documents.document` (Odoo 17+, `is_folder=true`) or `documents.folder`; names tried: "Accounts Payable", "Account Payables", "AP", "Vendor Bills" |
+| `industry` | General task (`x_studio_industry`) or TARGET Odoo (`res.company`, `res.partner`) |
 
-These are refreshed every run and written back to the Google Sheet.
+Refreshed on each `getRoutingRows` and written back to the Google Sheet.
