@@ -1,4 +1,5 @@
 node_modules/
 .env
 cloudrun.env.yaml
+COMMANDS.md
 npm-debug.log*
