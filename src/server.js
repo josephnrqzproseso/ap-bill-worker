@@ -6,7 +6,15 @@ const { runWorker, runOne, listApDocuments, collectFeedback, handleDocumentDelet
 
 const logger = createLogger(config.server.logLevel);
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use((req, res, next) => {
+  express.json({ limit: "1mb" })(req, res, (err) => {
+    if (err && err.type === "entity.parse.failed") {
+      req.body = {};
+      return next();
+    }
+    next(err);
+  });
+});
 
 let isRunning = false;
 let runOneCount = 0;
