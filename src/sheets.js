@@ -93,6 +93,7 @@ function indexToColLetter(idx) {
 }
 
 async function saveRoutingSheetData(config, headers, rows) {
+  if (config.routing?.source === "odoo") return;
   const vatCols = [
     "vat_purchase_tax_id_goods", "vat_purchase_tax_id_services", "vat_purchase_tax_id_generic",
     "purchase_journal_id", "ap_folder_id", "industry"

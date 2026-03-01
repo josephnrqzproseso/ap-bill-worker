@@ -81,14 +81,11 @@ class OdooClient {
 }
 
 function kwWithCompany(companyId, extra = {}) {
-  return {
-    context: {
-      allowed_company_ids: [Number(companyId)],
-      force_company: Number(companyId),
-      company_id: Number(companyId)
-    },
-    ...extra
-  };
+  const cid = Number(companyId) || 0;
+  const context = cid
+    ? { allowed_company_ids: [cid], force_company: cid, company_id: cid }
+    : {};
+  return { context, ...extra };
 }
 
 module.exports = {

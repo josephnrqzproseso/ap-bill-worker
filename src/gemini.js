@@ -1,5 +1,6 @@
 // @ts-nocheck
 const { safeJsonParse, sleep } = require("./utils");
+const { loadFeedbackCorrections } = require("./gcsFeedback");
 
 const RETRYABLE_STATUS = new Set([429, 500, 503]);
 const MAX_RETRIES = 2;
@@ -420,11 +421,25 @@ const accountAssignmentSchema = {
   required: ["assignments", "bill_level_account_id", "bill_level_account_code", "bill_level_account_name", "bill_level_confidence"]
 };
 
-async function assignAccountsWithGemini(extracted, expenseAccounts, config, industry, ocrText) {
+async function assignAccountsWithGemini(extracted, expenseAccounts, config, targetKey, industry, ocrText) {
   if (!expenseAccounts?.length) return null;
 
   const lineItems = extracted?.line_items || [];
   const hint = extracted?.expense_account_hint || {};
+  const feedbackList = await loadFeedbackCorrections(String(targetKey || "").trim(), String(industry || "").trim(), 20);
+  const feedbackSection =
+    feedbackList.length > 0
+      ? `
+LEARNED FROM PAST CORRECTIONS (prefer these when they apply):
+${feedbackList
+  .map(
+    (r) =>
+      `- Vendor "${r.vendor_name}" / item "${r.item_description}": was corrected from [${r.original_account_code}] ${r.original_account_name} → use [${r.corrected_account_code}] ${r.corrected_account_name}`
+  )
+  .join("\n")}
+When the vendor or item matches above, prefer the corrected account.
+`
+      : "";
 
   const accountList = expenseAccounts
     .map((a) => `  ${a.id}: [${a.code}] ${a.name}`)
@@ -504,7 +519,7 @@ Bill-level suggested account name: ${hint.suggested_account_name || "(none)"}
 Vendor name: ${extracted?.vendor?.name || "(unknown)"}
 Vendor trade name: ${extracted?.vendor_details?.trade_name || "(same)"}
 Vendor entity type: ${extracted?.vendor_details?.entity_type || "unknown"}
-${industrySection}${ocrSection}
+${industrySection}${feedbackSection}${ocrSection}
 RULES (MANDATORY - follow ALL):
 
 1. YOU MUST PICK AN ACCOUNT. Returning an account_id of 0 or an ID not in the list above is NOT allowed. Always select the closest match from the available accounts.
@@ -566,7 +581,9 @@ RULES (MANDATORY - follow ALL):
     data?.candidates?.[0]?.content?.parts?.[0]?.text ||
     data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n") ||
     "{}";
-  return safeJsonParse(raw, null);
+  const parsed = safeJsonParse(raw, null);
+  if (!parsed) return null;
+  return { ...parsed, _feedbackCount: feedbackList.length };
 }
 
 module.exports = {

@@ -1,19 +1,23 @@
 const express = require("express");
 const { config, validateConfig } = require("./config");
 const { createLogger } = require("./logger");
-const { runWorker, runOne, listApDocuments } = require("./worker");
+const { sleep } = require("./utils");
+const { runWorker, runOne, listApDocuments, collectFeedback, handleDocumentDelete } = require("./worker");
 
 const logger = createLogger(config.server.logLevel);
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 let isRunning = false;
+let runOneCount = 0;
 
-function isAuthorized(req) {
+function isAuthorized(req, bodySecret = null) {
   if (!config.server.sharedSecret) return true;
   const ip = req.ip || req.socket?.remoteAddress || "";
   if (ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return true;
-  const token = (req.header("x-worker-secret") || "").trim();
+  const headerToken = (req.header("x-worker-secret") || "").trim();
+  const bodyToken = bodySecret != null ? String(bodySecret || "").trim() : "";
+  const token = headerToken || bodyToken;
   return token && token === config.server.sharedSecret;
 }
 
@@ -27,7 +31,14 @@ app.get("/health", (_req, res) => {
 
 app.get("/", (_req, res) => {
   // When adding a new route (e.g. /collect-feedback, webhooks), add it here so GET / lists all available endpoints.
-  res.status(200).json({ ok: true, service: "ap-bill-ocr-worker", routes: ["/health", "/healthz", "/run", "/run-one", "/list-docs", "/debug"] });
+  res.status(200).json({
+  ok: true,
+  service: "ap-bill-ocr-worker",
+  routes: [
+    "/health", "/healthz", "/run", "/run-one", "/list-docs", "/debug",
+    "/collect-feedback", "/webhook/document-upload", "/webhook/document-delete"
+  ]
+});
 });
 
 app.get("/list-docs", async (req, res) => {
@@ -182,10 +193,15 @@ app.get("/run", async (req, res) => {
 
 app.post("/run-one", async (req, res) => {
   if (!isAuthorized(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
-  if (isRunning) return res.status(409).json({ ok: false, error: "already_running" });
-  isRunning = true;
+  if (isRunning) return res.status(409).json({ ok: false, error: "already_running", message: "Full worker run in progress." });
+  const maxConcurrent = config.server.runOneMaxConcurrency || 5;
+  if (runOneCount >= maxConcurrent) {
+    res.setHeader("Retry-After", "30");
+    return res.status(503).json({ ok: false, error: "too_many_concurrent_run_one", message: "Max concurrent run-one reached; retry later." });
+  }
+  runOneCount += 1;
   try {
-    logger.info("Worker run-one started.", { trigger: "http_post", payload: req.body || {} });
+    logger.info("Worker run-one started.", { trigger: "http_post", payload: req.body || {}, runOneCount });
     const result = await runOne({ logger, payload: req.body || {} });
     logger.info("Worker run-one finished.", { targetKey: result.targetKey, docId: result.doc?.id, status: result.result?.status });
     return res.status(200).json(result);
@@ -195,7 +211,89 @@ app.post("/run-one", async (req, res) => {
     logger.error("Worker run-one failed.", { error: msg, detail });
     return res.status(500).json({ ok: false, error: msg, detail: detail || undefined });
   } finally {
-    isRunning = false;
+    runOneCount -= 1;
+  }
+});
+
+app.post("/collect-feedback", async (req, res) => {
+  if (!isAuthorized(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  try {
+    const result = await collectFeedback(logger);
+    return res.status(200).json(result);
+  } catch (err) {
+    const msg = err?.message || String(err);
+    logger.error("collect-feedback failed.", { error: msg });
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+app.post("/webhook/document-upload", async (req, res) => {
+  if (!isAuthorized(req, req.body?.worker_secret)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  if (isRunning) return res.status(409).json({ ok: false, error: "already_running", message: "Full worker run in progress." });
+  const maxConcurrent = config.server.runOneMaxConcurrency || 5;
+  if (runOneCount >= maxConcurrent) {
+    res.setHeader("Retry-After", "30");
+    return res.status(503).json({ ok: false, error: "too_many_concurrent_run_one", message: "Max concurrent run-one reached; retry later." });
+  }
+  const payload = req.body || {};
+  const docId = Number(payload.doc_id || payload.document_id || payload.id || 0);
+  const attachmentId = Number(payload.attachment_id || 0);
+  const targetKey = String(payload.target_key || "").trim();
+  if (!docId && !attachmentId) {
+    return res.status(400).json({ ok: false, error: "doc_id or attachment_id required" });
+  }
+  runOneCount += 1;
+  const retryDelaysMs = [0, 200, 400, 800]; // instant first try; backoff only when race (document/attachment not committed yet)
+  let lastError = null;
+  let lastResult = null;
+  try {
+    for (let attempt = 0; attempt < retryDelaysMs.length; attempt++) {
+      if (attempt > 0) {
+        const delay = retryDelaysMs[attempt];
+        logger.info("Webhook document-upload: retrying after race.", { doc_id: docId, attempt: attempt + 1, delay_ms: delay });
+        await sleep(delay);
+      }
+      try {
+        logger.info("Webhook document-upload: run-one attempt.", { doc_id: docId, attachment_id: attachmentId, target_key: targetKey || "(any)", runOneCount, attempt: attempt + 1 });
+        lastResult = await runOne({ logger, payload: { doc_id: docId, attachment_id: attachmentId, target_key: targetKey || undefined } });
+        const reason = lastResult?.result?.reason;
+        const skip = lastResult?.result?.status === "skip" && (reason === "no_attachment" || reason === "attachment_not_found");
+        if (!skip) return res.status(200).json(lastResult);
+        lastError = new Error(`Transient: ${reason}`);
+      } catch (err) {
+        lastError = err;
+        const msg = err?.message || String(err);
+        const isRace = /document not found|not found for attachment_id/i.test(msg);
+        if (!isRace || attempt === retryDelaysMs.length - 1) {
+          logger.error("Webhook document-upload failed.", { error: msg });
+          return res.status(500).json({ ok: false, error: msg });
+        }
+      }
+    }
+    if (lastResult) return res.status(200).json(lastResult);
+    const msg = lastError?.message || String(lastError);
+    logger.error("Webhook document-upload failed after retries.", { error: msg });
+    return res.status(500).json({ ok: false, error: msg });
+  } finally {
+    runOneCount -= 1;
+  }
+});
+
+app.post("/webhook/document-delete", async (req, res) => {
+  if (!isAuthorized(req, req.body?.worker_secret)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  try {
+    const payload = req.body || {};
+    const result = await handleDocumentDelete(logger, payload);
+    if (result.error === "missing_doc_id") return res.status(400).json(result);
+    if (result.ok === false && result.error) {
+      const status = result.error === "bill_not_draft" ? 409 : 404;
+      return res.status(status).json(result);
+    }
+    return res.status(200).json(result);
+  } catch (err) {
+    const msg = err?.message || String(err);
+    logger.error("Webhook document-delete failed.", { error: msg });
+    return res.status(500).json({ ok: false, error: msg });
   }
 });
 
