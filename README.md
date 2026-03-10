@@ -272,8 +272,33 @@ Click **Save & Close** (or **Save & New** to add another action).
 | **URL** | Your worker base URL + `/webhook/document-delete`. Example: `https://ap-bill-ocr-worker-xxxxx.run.app/webhook/document-delete`. No trailing slash. |
 | **Fields** | Select **ID** so the payload includes the document ID. The worker accepts `doc_id`, `document_id`, or `id` in the body. If you use a custom body: `{"doc_id": {{ record.id }}}` or `{"id": {{ record.id }}}`, or with secret: `{"doc_id": {{ record.id }}, "worker_secret": "<same value as WORKER_SHARED_SECRET in your .env>"}`. |
 | **Sample Payload** | Check that the body contains the document ID. |
+| **Headers** (if the form has this) | Add header name `x-worker-secret`, value = the same string as `WORKER_SHARED_SECRET` in your worker `.env`. |
 
 Click **Save & Close**.
+
+---
+
+#### 3. Bank Statement Webhooks
+
+If you use the Bank Statement parser, you need to set up three additional webhooks on the `documents.document` model.
+
+**Bank Statement Upload:**
+* **Trigger:** On create (or On create and edit)
+* **URL:** Your worker base URL + `/webhook/bs-document-upload`
+* **Body/Fields:** Must include `doc_id` (record ID). Optionally pass `worker_secret` using a custom body.
+* **Domain:** Optional, but recommended to restrict to your bank statement folder (`[('folder_id.name', 'ilike', 'bank')]`).
+
+**Bank Statement Delete:**
+* **Trigger:** On deletion
+* **URL:** Your worker base URL + `/webhook/bs-document-delete`
+* **Body/Fields:** Must include `doc_id` (record ID).
+
+**Bank Statement Chatter Message (for @worker retry):**
+* **Model:** **Message** (`mail.message`)
+* **Trigger:** On create
+* **Apply on (Domain):** `[('model', '=', 'documents.document'), ('body', 'ilike', '@worker')]`
+* **URL:** Your worker base URL + `/webhook/bs-chatter-message`
+* **Body/Fields:** Send a custom body: `{"doc_id": {{ record.res_id }}, "message_body": "{{ record.body }}"}` (add `worker_secret` if needed).
 
 ---
 
