@@ -194,6 +194,8 @@ When a file is **uploaded** or **deleted** in Odoo Documents, you can have Odoo 
 
 ### Endpoints
 
+Your **worker base URL** is the URL where you deployed the worker to Google Cloud Run (e.g., `https://ap-bill-ocr-worker-XXXXXX.asia-southeast1.run.app`). Do not add a trailing slash to the base URL.
+
 | Event            | Method | URL (relative)              | Body (JSON) |
 |-----------------|--------|------------------------------|-------------|
 | Document upload | POST   | `/webhook/document-upload`   | `doc_id` (required) or `attachment_id`; optional `target_key` |
