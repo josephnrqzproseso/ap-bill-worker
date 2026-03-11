@@ -354,6 +354,13 @@ LINE ITEM CATEGORIZATION:
   fabric/cloth/textile/thread -> "inventory" or "supplies", hardware/tools -> "supplies", lumber/cement -> "inventory"
 - If the item description is unreadable or a brand name (e.g. "Hiroshi #7" from a fabric vendor), use the VENDOR NAME to determine the category. A fabric vendor sells fabric → "inventory" or "supplies", NOT "other".
 
+PERMIT / LICENSE FEE DISTINCTION (CRITICAL):
+- "Taxes and Licenses" (or similar) accounts are for the ACTUAL government fee — the amount paid directly to the government for a permit, license, or tax assessment.
+- If a PRIVATE COMPANY (e.g. a consulting or services firm) is invoicing for PROCESSING or HANDLING a permit/license application on your behalf, that is a SERVICE FEE → category: "professional_fees", suggested: "Professional Fees" or "Outside Services".
+- Keywords that signal a SERVICE FEE (→ professional_fees): "processing", "assistance", "facilitation", "handling", "filing", "preparation", "renewal service", "registration service".
+- Keywords that signal the ACTUAL GOVERNMENT LICENSE/TAX (→ taxes/licenses): "business permit fee", "mayor's permit", "LTO fee", "BIR registration", "barangay clearance fee" — when paid directly to the issuing government agency.
+- Example: Proseso Consulting invoicing for "Business Permit processing" → professional_fees (they are charging for their service, not the permit itself).
+
 DISCOUNT DETECTION (CRITICAL):
 - Look for a "Disc.%", "Discount", or "Disc" column on the invoice.
 - If a line shows a discount (e.g. 5%, 10%), set discount_percent to that value (e.g. 5, 10).
@@ -381,8 +388,16 @@ YEAR vs AMOUNT CONFUSION (CRITICAL):
 - NEVER EVER extract 2024, 2025, 2026, or similar year-like numbers as grand_total, net_total, or line item amounts. If you are about to output "2025" as a total or price, STOP. You are mistakenly reading a date as an amount. Find the actual monetary value (e.g., 530).
 - Cross-check: if the line items sum to a number like 530 but you extracted 2025 as grand_total, the 2025 is a date string, not the total.
 
-Rules:
+DATE FORMAT RULES (CRITICAL):
 - invoice.date must be YYYY-MM-DD (best guess; if unknown, empty string + low confidence).
+- NEVER assume date format based on vendor location or country. A Singapore vendor does NOT mean DD/MM/YYYY. A US vendor does NOT mean MM/DD/YYYY by default.
+- The ONLY safe way to determine format is from the document itself:
+  - If the document explicitly writes the month as text (e.g. "March 11, 2026", "11 Nov 2026", "11-Mar-26") → parse literally.
+  - If the document uses numeric separators only (e.g. "03/11/2026"), treat it as MM/DD/YYYY UNLESS the first number is > 12 (in which case it must be DD/MM/YYYY).
+  - When ambiguous (both values ≤ 12), default to MM/DD/YYYY — do NOT flip to DD/MM/YYYY just because the vendor is from a country that commonly uses that format.
+- Add a warning if the date format is genuinely ambiguous.
+
+Rules:
 - line_items may be [] if not confident.
 - NEVER default to "other" category if the vendor name gives a clear hint about what they sell.`;
 }
@@ -583,6 +598,7 @@ RULES (MANDATORY - follow ALL):
    - Beer/wine/spirits vendor → If our company is in food/hospitality/bar → "Inventory - Beverages", "Cost of Sales". If not → "Meals & Entertainment".
    - Printing/stationery → "Office Supplies", "Printing & Stationery"
    - Electricity/water/internet → "Utilities"
+   - A consulting/services firm charging for permit/license PROCESSING (e.g. "Business Permit processing", "permit renewal service") → "Professional Fees" or "Outside Services". This is a service fee, NOT "Taxes and Licenses". Only use "Taxes and Licenses" when the invoice is FROM the government agency charging the actual permit/license fee itself.
 
 3. VENDOR NAME IS YOUR STRONGEST CLUE when the item description is unclear (bad OCR, handwritten, brand name gibberish). A "LAUNDRY SHOP" sells laundry services. A "FABRIC TRADING" sells fabric. A "MARKETING CORPORATION" selling beer is a beer distributor.
 
