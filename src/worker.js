@@ -2548,12 +2548,42 @@ async function runOne({ logger, payload = {} }) {
     );
   }
 
-  if (doc.res_model === "account.move" && doc.res_id) {
-    const existingBill = await odoo.searchRead(
-      "account.move",
-      [["id", "=", Number(doc.res_id)]],
-      ["id", "state"],
-      kwWithCompany(companyId, { limit: 1 })
+  const resolvedVatIds = await pickVatTaxesForCompany(odoo, companyId);
+
+  let apFolderId = Number(target.apFolderId || 0);
+  let useIsFolder = false;
+  if (!apFolderId) {
+    const parentName = String(target.apFolderParent ?? "").trim() || undefined;
+    const r = await resolveApFolderId(odoo, companyId, { parentFolderName: parentName });
+    apFolderId = r.apFolderId;
+    useIsFolder = r.useIsFolder;
+  }
+
+  const result = await processOneDocument({
+    logger,
+    odoo,
+    companyId,
+    targetKey: target.targetKey,
+    doc,
+    resolvedVatIds,
+    purchaseJournalId: target.purchaseJournalId,
+    industry: target.industry,
+    reprocess: forceReprocess,
+    apFolderId,
+    useIsFolder,
+    userHint
+  });
+
+  return {
+    ok: true,
+    mode: "run-one",
+    time_start: timeStart,
+    time_completed: new Date().toISOString(),
+    targetKey: target.targetKey,
+    doc: { id: Number(doc.id), name: String(doc.name || ""), attachment_id: m2oId(doc.attachment_id) },
+    result
+  };
+}
     );
     if (existingBill?.length) {
       const billState = existingBill[0].state;
