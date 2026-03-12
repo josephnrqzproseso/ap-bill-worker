@@ -2466,6 +2466,18 @@ async function processOneDocument(args) {
       docId: doc.id, billId, error: linkErr?.message || String(linkErr)
     });
   }
+
+  const oldDocName = String(doc.name || "document");
+  const prefix = "[Bill Created] ";
+  const newDocName = oldDocName.startsWith(prefix) ? oldDocName : `${prefix}${oldDocName}`;
+  if (newDocName !== oldDocName) {
+    try {
+      await odoo.write("documents.document", [Number(doc.id)], { name: newDocName });
+    } catch (renameErr) {
+      logger.warn("Failed to rename document.", { docId: doc.id, error: renameErr?.message });
+    }
+  }
+
   await safeMessagePost(
     odoo,
     companyId,

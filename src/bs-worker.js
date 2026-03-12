@@ -526,6 +526,17 @@ async function processBsDocument({ odoo, companyId, targetKey, doc, logger, conf
     await odoo.write("ir.attachment", [attId], { description: newDesc });
   } catch (_) { /* non-critical */ }
 
+  const oldDocName = String(doc.name || "document");
+  const prefix = "[BS Imported] ";
+  const newDocName = oldDocName.startsWith(prefix) ? oldDocName : `${prefix}${oldDocName}`;
+  if (newDocName !== oldDocName) {
+    try {
+      await odoo.write("documents.document", [docId], { name: newDocName });
+    } catch (renameErr) {
+      logger.warn("Failed to rename BS document.", { docId, error: renameErr?.message });
+    }
+  }
+
   // Continuity check
   const continuity = await checkContinuity(odoo, companyId, journalId, extracted);
 
