@@ -1132,7 +1132,26 @@ async function getTaxMeta(odoo, companyId, taxIds) {
   };
 }
 
-async function findDuplicateBill(odoo, companyId, vendorId, extracted) {
+async function findDuplicateBill(odoo, companyId, vendorId, extracted, docId) {
+  // First check if the document is already explicitly linked to any bill
+  if (docId) {
+    const docRows = await odoo.searchRead(
+      "documents.document",
+      [["id", "=", Number(docId)], ["res_model", "=", "account.move"]],
+      ["res_id"],
+      kwWithCompany(companyId, { limit: 1 })
+    );
+    if (docRows?.length && docRows[0].res_id) {
+      const existingBill = await odoo.searchRead(
+        "account.move",
+        [["id", "=", Number(docRows[0].res_id)]],
+        ["id", "ref", "amount_total", "state"],
+        kwWithCompany(companyId, { limit: 1 })
+      );
+      if (existingBill?.length) return existingBill[0];
+    }
+  }
+
   const invoiceNumber = String(extracted?.invoice?.number || "").trim();
   const amountTotal = Number(extracted?.totals?.grand_total || 0);
   const domain = [["move_type", "=", "in_invoice"]];
@@ -2271,7 +2290,7 @@ async function processOneDocument(args) {
   }
 
   if (!reprocess) {
-    const duplicate = await findDuplicateBill(odoo, companyId, vendor.id, extracted);
+    const duplicate = await findDuplicateBill(odoo, companyId, vendor.id, extracted, doc.id);
     if (duplicate?.id) {
       const marker = makeProcessedMarker(
         config.scan.processedMarkerPrefix,
