@@ -792,20 +792,32 @@ function pickVendorFromExtraction(extracted, ocrText) {
 
 async function safeMessagePost(odoo, companyId, model, resId, body) {
   try {
-    await odoo.executeKw(
-      model,
-      "message_post",
-      [[Number(resId)]],
-      kwWithCompany(companyId, {
-        body: String(body || ""),
-        message_type: "comment",
-        subtype_xmlid: "mail.mt_note",
-        body_is_html: true
-      })
-    );
+    const kwargs = kwWithCompany(companyId, {
+      body: String(body || ""),
+      message_type: "comment",
+      subtype_xmlid: "mail.mt_note",
+      body_is_html: true
+    });
+
+    await odoo.executeKw(model, "message_post", [[Number(resId)]], kwargs);
   } catch (_err) {
-    // best effort — log so silent failures are visible in Cloud Run logs
-    console.warn("[safeMessagePost] failed", { model, resId, error: _err?.message || String(_err) });
+    const errMsg = String(_err?.message || _err);
+    if (errMsg.includes("'NoneType' object has no attribute 'xpath'")) {
+      // In some older or customized Odoo versions, message_post can fail when parsing the body XML 
+      // if it expects standard text but gets HTML. Let's retry without body_is_html, or simplify.
+      try {
+        const fallbackKwargs = kwWithCompany(companyId, {
+          body: String(body || ""),
+          message_type: "comment"
+        });
+        await odoo.executeKw(model, "message_post", [[Number(resId)]], fallbackKwargs);
+        return; // Success on fallback
+      } catch (fallbackErr) {
+        console.warn("[safeMessagePost] fallback also failed", { model, resId, error: fallbackErr?.message || String(fallbackErr) });
+      }
+    } else {
+      console.warn("[safeMessagePost] failed", { model, resId, error: errMsg });
+    }
   }
 }
 
