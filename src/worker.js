@@ -1228,6 +1228,12 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, ext
   // Only PH entities get EWT
   if (country && !/philipp|^ph$/i.test(country)) return 0;
 
+  // Foreign vendors are not subject to PH EWT (only domestic/resident payees)
+  if (typeof extracted?.vendor_details?.address === "object" && extracted?.vendor_details?.address !== null) {
+    const vendorCountry = String(extracted.vendor_details.address.country || "").toLowerCase().trim();
+    if (vendorCountry && !/philipp|^ph$/i.test(vendorCountry)) return 0;
+  }
+
   // GPPs are exempt from income tax — not subject to EWT
   if (isVendorGPP(extracted)) return 0;
 
