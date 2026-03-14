@@ -289,26 +289,39 @@ async function pickVatTaxesForCompany(odoo, companyId) {
   const id = (t) => (t ? Number(t.id) : 0);
 
   // --- Withholding / EWT tax picking ---
+  // BIR ATC: WI = individual/sole proprietor, WC = corporate/non-individual
   const whtTaxes = taxes.filter((t) => isWithholding(t) && t.amount_type === "percent" && Number(t.amount || 0) < 0);
-  const pickWhtByRate = (targetRate) => {
+  const isWI = (t) => has(t, /\bwi\d|\bindiv|\bperson/);
+  const isWC = (t) => has(t, /\bwc\d|\bcorp|\bnon[-\s]?indiv|\bjurid/);
+  const pickWhtByRate = (targetRate, preferWI) => {
     const tolerance = 0.5;
     let best = null;
-    let bestDist = Infinity;
+    let bestScore = -Infinity;
     for (const t of whtTaxes) {
       const dist = Math.abs(Number(t.amount) - targetRate);
       if (dist > tolerance) continue;
-      if (dist < bestDist || (dist === bestDist && norm(t.type_tax_use) === "purchase")) {
-        best = t;
-        bestDist = dist;
-      }
+      let s = 100 - dist * 10;
+      // Prefer WI/WC match if specified
+      if (preferWI === true && isWI(t)) s += 20;
+      else if (preferWI === false && isWC(t)) s += 20;
+      // Prefer purchase-type taxes
+      if (norm(t.type_tax_use) === "purchase") s += 5;
+      if (s > bestScore) { best = t; bestScore = s; }
     }
     return best;
   };
-  const ewt1pct = pickWhtByRate(-1);
-  const ewt2pct = pickWhtByRate(-2);
-  const ewt5pct = pickWhtByRate(-5);
-  const ewt10pct = pickWhtByRate(-10);
-  const ewt15pct = pickWhtByRate(-15);
+  // Pick EWT taxes for both WI (individual) and WC (corporate) variants
+  // null = no preference, true = prefer WI, false = prefer WC
+  const ewtWI1 = pickWhtByRate(-1, true);
+  const ewtWC1 = pickWhtByRate(-1, false);
+  const ewtWI2 = pickWhtByRate(-2, true);
+  const ewtWC2 = pickWhtByRate(-2, false);
+  const ewtWI5 = pickWhtByRate(-5, true);
+  const ewtWC5 = pickWhtByRate(-5, false);
+  const ewtWI10 = pickWhtByRate(-10, true);
+  const ewtWC10 = pickWhtByRate(-10, false);
+  const ewtWI15 = pickWhtByRate(-15, true);
+  const ewtWC15 = pickWhtByRate(-15, false);
 
   return {
     goodsId: id(goods) || id(generic),
@@ -321,11 +334,14 @@ async function pickVatTaxesForCompany(odoo, companyId) {
     exemptImportsId: id(exemptImports),
     zeroRatedId: id(zeroRated),
     genericId: id(generic),
-    ewt1Id: id(ewt1pct),
-    ewt2Id: id(ewt2pct),
-    ewt5Id: id(ewt5pct),
-    ewt10Id: id(ewt10pct),
-    ewt15Id: id(ewt15pct),
+    // EWT taxes keyed by WI (individual) / WC (corporate) and rate
+    ewt: {
+      wi1: id(ewtWI1), wc1: id(ewtWC1),
+      wi2: id(ewtWI2), wc2: id(ewtWC2),
+      wi5: id(ewtWI5), wc5: id(ewtWC5),
+      wi10: id(ewtWI10), wc10: id(ewtWC10),
+      wi15: id(ewtWI15), wc15: id(ewtWC15),
+    },
     _meta: {
       priceInclude: !!(generic || goods || services)?.price_include,
       amount: Number((generic || goods || services)?.amount || 12)
@@ -1146,35 +1162,57 @@ function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry, ex
 
   if (gs === "services" && taxMap.servicesId) return [taxMap.servicesId];
   if (gs === "goods" && taxMap.goodsId) return [taxMap.goodsId];
-  if (cat && /professional_fees|rent|repairs|freight|utilities|commission|contractor/.test(cat) && taxMap.servicesId) return [taxMap.servicesId];
+  if (cat && /professional_fees|outsourced_services|rent|repairs|freight|utilities|commission|contractor/.test(cat) && taxMap.servicesId) return [taxMap.servicesId];
   if (cat && /office_supplies|inventory|fuel|meals/.test(cat) && taxMap.goodsId) return [taxMap.goodsId];
 
   return taxMap.genericId ? [taxMap.genericId] : [];
 }
 
 /**
- * Maps an EWT rate (positive number like 1, 2, 5, 10, 15) to the matching taxMap ID.
+ * Picks the EWT tax ID from taxMap.ewt by rate and vendor type (individual vs corporate).
+ * vendorIsIndividual: true = WI codes, false = WC codes.
  */
-function ewtIdByRate(taxMap, rate) {
+function ewtIdByRate(taxMap, rate, vendorIsIndividual) {
+  const ewt = taxMap.ewt || {};
   const r = Math.round(Number(rate) || 0);
-  if (r === 1) return taxMap.ewt1Id || 0;
-  if (r === 2) return taxMap.ewt2Id || 0;
-  if (r === 5) return taxMap.ewt5Id || 0;
-  if (r === 10) return taxMap.ewt10Id || 0;
-  if (r === 15) return taxMap.ewt15Id || 0;
+  const wi = vendorIsIndividual !== false; // default to WI if unknown
+  if (r === 1) return (wi ? ewt.wi1 : ewt.wc1) || ewt.wi1 || ewt.wc1 || 0;
+  if (r === 2) return (wi ? ewt.wi2 : ewt.wc2) || ewt.wi2 || ewt.wc2 || 0;
+  if (r === 5) return (wi ? ewt.wi5 : ewt.wc5) || ewt.wi5 || ewt.wc5 || 0;
+  if (r === 10) return (wi ? ewt.wi10 : ewt.wc10) || ewt.wi10 || ewt.wc10 || 0;
+  if (r === 15) return (wi ? ewt.wi15 : ewt.wc15) || ewt.wi15 || ewt.wc15 || 0;
   return 0;
+}
+
+/**
+ * Determines whether the vendor is an individual (WI) or non-individual/corporate (WC)
+ * based on extracted entity_type.
+ * Returns true for individual/sole_proprietor, false for corporation, undefined for unknown.
+ */
+function isVendorIndividual(extracted) {
+  const et = String(extracted?.vendor_details?.entity_type || "").toLowerCase();
+  if (et === "individual" || et === "sole_proprietor") return true;
+  if (et === "corporation") return false;
+  return undefined; // unknown — caller decides default
 }
 
 /**
  * Determines which EWT (Expanded Withholding Tax) ID applies to a bill line.
  * Returns 0 if no EWT applies.
  *
+ * Uses BIR ATC codes:
+ *   WI = individual/sole proprietor, WC = corporate/juridical
+ *
  * Priority:
- *  1. If the invoice itself shows an EWT rate (extracted.withholding_tax.ewt_rate), use that
+ *  1. If the invoice itself shows an EWT rate (extracted.withholding_tax), use that
  *  2. Otherwise, determine from TWA status + expense category per BIR RR 11-2018:
- *     - TWA: 1% goods, 2% services (all purchases)
- *     - Non-TWA: professional_fees → 10%, rent → 5%, repairs/contractors → 2%,
- *       freight → 2%, commission → 10%
+ *     - TWA: 1% goods (WI157/WC157), 2% services (WI158/WC158)
+ *     - professional_fees: 5-15% (WI100/WC100)
+ *     - outsourced_services: 2% (WI120/WC120)
+ *     - rent: 5% (WI120/WC120)
+ *     - contractor/repairs: 2% (WI140/WC140)
+ *     - commission: 10% (WI150/WC150)
+ *     - freight: 2%
  */
 function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, extracted) {
   const { country, isTopWithholdingAgent } = entityFlags || {};
@@ -1182,10 +1220,12 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, ext
   // Only PH entities get EWT
   if (country && !/philipp|^ph$/i.test(country)) return 0;
 
+  const vendorIndiv = isVendorIndividual(extracted);
+
   // If the invoice explicitly shows an EWT rate, prefer that
   const wht = extracted?.withholding_tax;
   if (wht?.detected && wht.ewt_rate > 0) {
-    const invoiceEwtId = ewtIdByRate(taxMap, wht.ewt_rate);
+    const invoiceEwtId = ewtIdByRate(taxMap, wht.ewt_rate, vendorIndiv);
     if (invoiceEwtId) return invoiceEwtId;
   }
 
@@ -1193,23 +1233,32 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, ext
   const gs = String(goodsOrServices || "").toLowerCase();
 
   if (isTopWithholdingAgent) {
-    // TWA: 1% on goods, 2% on services
-    if (gs === "goods") return taxMap.ewt1Id || 0;
-    if (gs === "services") return taxMap.ewt2Id || 0;
-    // Default to 2% for unknown (services is more common in AP)
-    return taxMap.ewt2Id || taxMap.ewt1Id || 0;
+    // TWA: 1% on goods (WI157/WC157), 2% on services (WI158/WC158)
+    if (gs === "goods") return ewtIdByRate(taxMap, 1, vendorIndiv);
+    if (gs === "services") return ewtIdByRate(taxMap, 2, vendorIndiv);
+    return ewtIdByRate(taxMap, 2, vendorIndiv) || ewtIdByRate(taxMap, 1, vendorIndiv);
   }
 
-  // Non-TWA: only specific categories per BIR RR 11-2018
-  if (cat === "professional_fees") return taxMap.ewt10Id || taxMap.ewt15Id || 0;
-  if (cat === "rent") return taxMap.ewt5Id || 0;
-  if (cat === "repairs" || cat === "contractor") return taxMap.ewt2Id || 0;
-  if (cat === "freight") return taxMap.ewt2Id || 0;
-  if (cat === "commission") return taxMap.ewt10Id || 0;
+  // Non-TWA: specific categories per BIR RR 11-2018
+  // Professional fees: WI100 5%/10% individual, WC100 10%/15% corporate
+  if (cat === "professional_fees") {
+    if (vendorIndiv === false) return ewtIdByRate(taxMap, 15, false) || ewtIdByRate(taxMap, 10, false);
+    return ewtIdByRate(taxMap, 10, true) || ewtIdByRate(taxMap, 5, true);
+  }
+  // Outsourced services: 2% (WI120/WC120) — NOT professional fees
+  if (cat === "outsourced_services") return ewtIdByRate(taxMap, 2, vendorIndiv);
+  // Rental: 5% (WI120/WC120)
+  if (cat === "rent") return ewtIdByRate(taxMap, 5, vendorIndiv);
+  // Contractors/repairs: 2% (WI140/WC140)
+  if (cat === "repairs" || cat === "contractor") return ewtIdByRate(taxMap, 2, vendorIndiv);
+  // Freight: 2%
+  if (cat === "freight") return ewtIdByRate(taxMap, 2, vendorIndiv);
+  // Commission: 10% (WI150/WC150)
+  if (cat === "commission") return ewtIdByRate(taxMap, 10, vendorIndiv);
 
   // Non-TWA with no matching category but invoice shows EWT → still try to apply
   if (wht?.detected && wht.ewt_rate > 0) {
-    return ewtIdByRate(taxMap, wht.ewt_rate);
+    return ewtIdByRate(taxMap, wht.ewt_rate, vendorIndiv);
   }
 
   return 0;
@@ -2674,12 +2723,16 @@ async function processOneDocument(args) {
     const ewtCountry = String(entityFlags?.country || "").trim();
     const isPHEntity = !ewtCountry || /philipp|^ph$/i.test(ewtCountry);
     if (isPHEntity) {
-      const hasAnyEwt = taxMap.ewt1Id || taxMap.ewt2Id || taxMap.ewt5Id || taxMap.ewt10Id || taxMap.ewt15Id;
+      const ewtMap = taxMap.ewt || {};
+      const hasAnyEwt = Object.values(ewtMap).some((v) => v > 0);
       const isTwa = !!entityFlags?.isTopWithholdingAgent;
       const wht = extracted?.withholding_tax;
       const invoiceEwtDetected = !!(wht?.detected);
       const ewtParts = [];
       if (isTwa) ewtParts.push("Entity is a Top Withholding Agent (TWA)");
+      const vendorIndiv = isVendorIndividual(extracted);
+      if (vendorIndiv === true) ewtParts.push("Vendor: individual/sole proprietor (WI codes)");
+      else if (vendorIndiv === false) ewtParts.push("Vendor: corporation/juridical (WC codes)");
       if (invoiceEwtDetected) {
         const detailParts = [];
         if (wht.ewt_rate) detailParts.push(`rate: ${wht.ewt_rate}%`);

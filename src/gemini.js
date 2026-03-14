@@ -112,7 +112,7 @@ const extractionSchema = {
     expense_account_hint: {
       type: "object",
       properties: {
-        category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|freight|other" },
+        category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|outsourced_services|freight|utilities|commission|contractor|other" },
         suggested_account_name: { type: "string" },
         confidence: { type: "number" },
         evidence: { type: "string" }
@@ -214,7 +214,7 @@ const extractionSchema = {
           amount: { type: "number" },
           unit_price_includes_vat: { type: "boolean", description: "true if the unit_price shown on the invoice already includes VAT" },
           discount_percent: { type: "number", description: "Discount percentage applied to this line (0-100). 0 if no discount. E.g. 5 means 5% discount, so net = unit_price * qty * (1 - 5/100)" },
-          expense_category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|freight|utilities|inventory|equipment|commission|contractor|other" },
+          expense_category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|outsourced_services|freight|utilities|inventory|equipment|commission|contractor|other" },
           goods_or_services: { type: "string", description: "Per-line: goods|services|unknown. 'goods' for physical items/supplies/inventory. 'services' for labor/consulting/professional fees/rent/repairs/subscriptions/SaaS." },
           is_capital_goods: { type: "boolean", description: "true if this line is a capital asset/equipment purchase (machinery, vehicles, computers, furniture, fixtures, PPE/property-plant-equipment). false for consumable supplies." },
           is_imported: { type: "boolean", description: "true if this line item is clearly imported from abroad (foreign supplier, customs duties mentioned, import documentation). false if domestic or unclear." },
@@ -387,14 +387,29 @@ ${ocrText || "(no OCR text available)"}
 
 LINE ITEM CATEGORIZATION:
 - For each line_items[] entry, set expense_category to the best matching category based on the item description AND vendor context:
-  office_supplies, meals, repairs, rent, fuel, professional_fees, freight, utilities, inventory, supplies, commission, contractor, other
+  office_supplies, meals, repairs, rent, fuel, professional_fees, outsourced_services, freight, utilities, inventory, supplies, commission, contractor, other
 - Examples: LPG/gas/diesel -> "fuel", paper/ink/toner -> "office_supplies", electricity/water -> "utilities",
-  consulting/legal/audit/accounting/legal/medical -> "professional_fees", food/catering -> "meals", shipping/delivery -> "freight",
+  food/catering -> "meals", shipping/delivery -> "freight",
   fabric/cloth/textile/thread -> "inventory" or "supplies", hardware/tools -> "supplies", lumber/cement -> "inventory",
   sales commission/agent fee/broker fee/referral fee -> "commission",
   construction/building/renovation/plumbing/electrical work/general contractor -> "contractor"
 - If the item description is unreadable or a brand name (e.g. "Hiroshi #7" from a fabric vendor), use the VENDOR NAME to determine the category. A fabric vendor sells fabric → "inventory" or "supplies", NOT "other".
-- IMPORTANT for withholding tax: Distinguish between "professional_fees" (lawyers, CPAs, engineers, architects, doctors, consultants), "contractor" (construction, building, renovation, specialty trades), and "commission" (sales agents, brokers, insurance agents). These have different withholding tax rates under Philippine BIR rules.
+
+PROFESSIONAL FEES vs OUTSOURCED SERVICES (CRITICAL for withholding tax):
+- "professional_fees" = services rendered by LICENSED PROFESSIONALS practicing their profession:
+  lawyers, CPAs/accountants, engineers, architects, doctors, dentists, auditors, appraisers, management consultants.
+  These are subject to higher EWT rates (WI100/WC100: 5-15%).
+- "outsourced_services" = general business services NOT requiring a professional license:
+  BPO, staffing/manpower, janitorial, security, IT support, bookkeeping services, payroll processing,
+  consulting firms providing outsourced operations (e.g. "Outsourcing Services Inc.", "Staffing Solutions"),
+  marketing services, advertising agencies, call centers, data entry.
+  These are subject to 2% EWT (WC120/WI120).
+- KEY DISTINCTION: A company named "XYZ Consulting" or "XYZ Outsourcing Services" that provides
+  outsourced staff, BPO, or operational support is "outsourced_services" NOT "professional_fees".
+  Only classify as "professional_fees" when the vendor is a licensed professional or professional firm
+  (law firm, CPA firm, engineering firm, medical clinic) providing professional opinions/expertise.
+- "contractor" = construction, building, renovation, specialty trades (2% EWT per WI140/WC140).
+- "commission" = sales agents, brokers, insurance agents (10% EWT per WI150/WC150).
 
 WITHHOLDING TAX DETECTION:
 - Look for any withholding tax (EWT/CWT) information on the invoice:
@@ -711,10 +726,11 @@ async function researchVendorWithGemini(vendorName, tradeName, config) {
   if (!name || name.length < 2) return null;
 
   const prompt = `Look up the company "${name}" using Google Search.
-Return a SHORT factual summary (max 3 sentences) covering:
+Return a SHORT factual summary (max 4 sentences) covering:
 1. What the company does / what products or services it sells
 2. The industry or sector (e.g. "SaaS / developer tools", "food & beverage distribution", "office supplies retail")
-3. What expense category a purchase from this vendor would typically fall under in accounting (e.g. "Software & Subscriptions", "Meals & Entertainment", "Professional Fees", "Office Supplies", "Utilities")
+3. What expense category a purchase from this vendor would typically fall under in accounting (e.g. "Software & Subscriptions", "Meals & Entertainment", "Professional Fees", "Outsourced Services", "Office Supplies", "Utilities")
+4. For Philippine service providers: Is this a LICENSED PROFESSIONAL FIRM (law, CPA, engineering, medical) or a GENERAL SERVICE/OUTSOURCING company? This matters for withholding tax classification.
 
 If the company is not well-known or search returns no useful results, say "No information found." and nothing else.`;
 
