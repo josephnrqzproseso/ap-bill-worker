@@ -1153,20 +1153,41 @@ function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry, ex
 }
 
 /**
+ * Maps an EWT rate (positive number like 1, 2, 5, 10, 15) to the matching taxMap ID.
+ */
+function ewtIdByRate(taxMap, rate) {
+  const r = Math.round(Number(rate) || 0);
+  if (r === 1) return taxMap.ewt1Id || 0;
+  if (r === 2) return taxMap.ewt2Id || 0;
+  if (r === 5) return taxMap.ewt5Id || 0;
+  if (r === 10) return taxMap.ewt10Id || 0;
+  if (r === 15) return taxMap.ewt15Id || 0;
+  return 0;
+}
+
+/**
  * Determines which EWT (Expanded Withholding Tax) ID applies to a bill line.
  * Returns 0 if no EWT applies.
  *
- * BIR RR 11-2018 rates:
- *  - TWA: 1% goods, 2% services (all purchases)
- *  - Non-TWA specific categories:
- *      professional_fees → 10%, rent → 5%, repairs/contractors → 2%,
- *      freight → 2%, commission → 10%
+ * Priority:
+ *  1. If the invoice itself shows an EWT rate (extracted.withholding_tax.ewt_rate), use that
+ *  2. Otherwise, determine from TWA status + expense category per BIR RR 11-2018:
+ *     - TWA: 1% goods, 2% services (all purchases)
+ *     - Non-TWA: professional_fees → 10%, rent → 5%, repairs/contractors → 2%,
+ *       freight → 2%, commission → 10%
  */
-function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags) {
+function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, extracted) {
   const { country, isTopWithholdingAgent } = entityFlags || {};
 
   // Only PH entities get EWT
   if (country && !/philipp|^ph$/i.test(country)) return 0;
+
+  // If the invoice explicitly shows an EWT rate, prefer that
+  const wht = extracted?.withholding_tax;
+  if (wht?.detected && wht.ewt_rate > 0) {
+    const invoiceEwtId = ewtIdByRate(taxMap, wht.ewt_rate);
+    if (invoiceEwtId) return invoiceEwtId;
+  }
 
   const cat = String(expenseCategory || "").toLowerCase();
   const gs = String(goodsOrServices || "").toLowerCase();
@@ -1185,6 +1206,11 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags) {
   if (cat === "repairs" || cat === "contractor") return taxMap.ewt2Id || 0;
   if (cat === "freight") return taxMap.ewt2Id || 0;
   if (cat === "commission") return taxMap.ewt10Id || 0;
+
+  // Non-TWA with no matching category but invoice shows EWT → still try to apply
+  if (wht?.detected && wht.ewt_rate > 0) {
+    return ewtIdByRate(taxMap, wht.ewt_rate);
+  }
 
   return 0;
 }
@@ -1931,7 +1957,7 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
 
       // Append EWT (withholding tax) if applicable
       const lineGs = String(item.goods_or_services || billGs || "").toLowerCase();
-      const ewtId = pickEwtTaxId(taxMap, item.expense_category, lineGs, entityFlags);
+      const ewtId = pickEwtTaxId(taxMap, item.expense_category, lineGs, entityFlags, extracted);
       if (ewtId && !lineTaxIds.includes(ewtId)) {
         lineTaxIds = [...lineTaxIds, ewtId];
       }
@@ -2003,7 +2029,7 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
     const hint = extracted?.expense_account_hint || {};
     const singleCat = lineItems[0]?.expense_category || hint.category || "other";
     const singleGs = String(extracted?.vat?.goods_or_services || "").toLowerCase();
-    const singleEwtId = pickEwtTaxId(taxMap, singleCat, singleGs, entityFlags);
+    const singleEwtId = pickEwtTaxId(taxMap, singleCat, singleGs, entityFlags, extracted);
     let singleTaxIds = [...billLevelTaxIds];
     if (singleEwtId && !singleTaxIds.includes(singleEwtId)) singleTaxIds.push(singleEwtId);
     if (singleTaxIds.length) line.tax_ids = [[6, 0, singleTaxIds]];
@@ -2650,19 +2676,30 @@ async function processOneDocument(args) {
     if (isPHEntity) {
       const hasAnyEwt = taxMap.ewt1Id || taxMap.ewt2Id || taxMap.ewt5Id || taxMap.ewt10Id || taxMap.ewt15Id;
       const isTwa = !!entityFlags?.isTopWithholdingAgent;
-      if (!hasAnyEwt) {
+      const wht = extracted?.withholding_tax;
+      const invoiceEwtDetected = !!(wht?.detected);
+      const ewtParts = [];
+      if (isTwa) ewtParts.push("Entity is a Top Withholding Agent (TWA)");
+      if (invoiceEwtDetected) {
+        const detailParts = [];
+        if (wht.ewt_rate) detailParts.push(`rate: ${wht.ewt_rate}%`);
+        if (wht.ewt_amount) detailParts.push(`amount: ${Number(wht.ewt_amount).toFixed(2)}`);
+        if (wht.atc_code) detailParts.push(`ATC: ${wht.atc_code}`);
+        if (wht.bir_form_reference) detailParts.push(`BIR Form: ${wht.bir_form_reference}`);
+        ewtParts.push(`Invoice shows withholding tax (${detailParts.join(", ")})`);
+      }
+      if (!hasAnyEwt && (isTwa || invoiceEwtDetected)) {
         await safeMessagePost(
           odoo, companyId, "account.move", Number(billId),
           `<b>⚠️ Withholding tax notice:</b> No EWT tax records found in the database. ` +
           `Please create the appropriate withholding tax records (e.g., EWT 1%, 2%, 5%, 10%) ` +
           `and the system will automatically apply them on future bills.` +
-          (isTwa ? ` This entity is a Top Withholding Agent — all purchases require EWT.` : ``)
+          (ewtParts.length ? `<br/>${ewtParts.join("<br/>")}` : ``)
         );
-      } else if (isTwa) {
-        const rateApplied = taxMap.ewt2Id ? "2%" : (taxMap.ewt1Id ? "1%" : "N/A");
+      } else if (ewtParts.length && hasAnyEwt) {
         await safeMessagePost(
           odoo, companyId, "account.move", Number(billId),
-          `<b>🏛️ EWT applied</b> — Entity is a Top Withholding Agent (TWA). ` +
+          `<b>🏛️ EWT applied</b> — ${ewtParts.join(". ")}. ` +
           `Expanded withholding tax applied on bill lines per BIR RR 11-2018.`
         );
       }

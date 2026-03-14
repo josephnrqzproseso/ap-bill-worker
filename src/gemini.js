@@ -153,6 +153,19 @@ const extractionSchema = {
         "evidence"
       ]
     },
+    withholding_tax: {
+      type: "object",
+      description: "Withholding tax (EWT/CWT) information detected on the invoice, if any. Philippine invoices may show EWT amounts, BIR Form 2307 references, or ATC codes.",
+      properties: {
+        detected: { type: "boolean", description: "true if any withholding tax information is visible on the invoice (EWT amount, BIR 2307 reference, ATC code, or 'less withholding tax' line)" },
+        ewt_amount: { type: "number", description: "Withholding tax amount shown on the invoice (the amount withheld). 0 if not detected." },
+        ewt_rate: { type: "number", description: "Withholding tax rate shown or implied (e.g. 1, 2, 5, 10, 15). 0 if not detected." },
+        atc_code: { type: "string", description: "BIR Alphanumeric Tax Code if shown (e.g. WI100, WC010, WI157). Empty if not detected." },
+        bir_form_reference: { type: "string", description: "BIR form number referenced (e.g. '2307', '2306'). Empty if not detected." },
+        evidence: { type: "string", description: "Short text snippet from the invoice showing the withholding tax info. Empty if not detected." }
+      },
+      required: ["detected", "ewt_amount", "ewt_rate", "atc_code", "bir_form_reference", "evidence"]
+    },
     totals: {
       type: "object",
       properties: {
@@ -216,6 +229,7 @@ const extractionSchema = {
     "vendor", "vendor_candidates",
     "invoice",
     "vat",
+    "withholding_tax",
     "totals",
     "amount_candidates",
     "line_items",
@@ -381,6 +395,20 @@ LINE ITEM CATEGORIZATION:
   construction/building/renovation/plumbing/electrical work/general contractor -> "contractor"
 - If the item description is unreadable or a brand name (e.g. "Hiroshi #7" from a fabric vendor), use the VENDOR NAME to determine the category. A fabric vendor sells fabric → "inventory" or "supplies", NOT "other".
 - IMPORTANT for withholding tax: Distinguish between "professional_fees" (lawyers, CPAs, engineers, architects, doctors, consultants), "contractor" (construction, building, renovation, specialty trades), and "commission" (sales agents, brokers, insurance agents). These have different withholding tax rates under Philippine BIR rules.
+
+WITHHOLDING TAX DETECTION:
+- Look for any withholding tax (EWT/CWT) information on the invoice:
+  - "Less: Withholding Tax", "Less: EWT", "Less: CWT", "W/Tax", "WHT"
+  - BIR Form 2307 or 2306 references
+  - ATC codes (e.g. WI100, WC010, WI157, WI158, WC100)
+  - A "Withholding Tax" line item that reduces the total amount due
+  - Percentage indicators like "EWT 2%", "WHT 5%", "10% EWT"
+- Set withholding_tax.detected = true if ANY of the above are found
+- Extract the ewt_amount (the amount being withheld, as a positive number)
+- Extract the ewt_rate if shown (e.g. 2 for 2%, 10 for 10%)
+- Extract the atc_code if visible (e.g. "WI100", "WC010")
+- Extract bir_form_reference if a BIR form number is mentioned
+- If none of these are found, set detected = false and all other fields to 0 or ""
 
 PERMIT / LICENSE FEE DISTINCTION (CRITICAL):
 - "Taxes and Licenses" (or similar) accounts are for the ACTUAL government fee — the amount paid directly to the government for a permit, license, or tax assessment.
