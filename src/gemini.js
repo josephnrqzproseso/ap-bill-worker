@@ -95,7 +95,7 @@ const extractionSchema = {
             country: { type: "string", description: "Country name" }
           }
         },
-        entity_type: { type: "string", description: "corporation|sole_proprietor|individual|unknown" },
+        entity_type: { type: "string", description: "corporation|sole_proprietor|individual|general_professional_partnership|unknown" },
         trade_name: { type: "string", description: "Business/trade name (DBA). For sole proprietors this is the shop/store name that differs from the owner's personal name" },
         proprietor_name: {
           type: "object",
@@ -309,6 +309,7 @@ VENDOR DETAIL REQUIREMENTS (PH):
   - "corporation" if the name ends with Inc., Corp., Co., LLC, Corporation, etc.
   - "sole_proprietor" if there is BOTH a trade/business name AND a personal owner name (e.g. "Prop.", "Owner:", or a personal name under/near a business name)
   - "individual" if the vendor is clearly a person with no business name
+  - "general_professional_partnership" (GPP) if the vendor is a partnership of licensed professionals (law firms, CPA firms, medical/dental partnerships). Look for: "& Associates", "& Partners", "& Co.", "Law Offices", "Law Firm", "CPA", "CPAs", "Attorneys", or multiple partner names listed. GPPs are exempt from income tax (pass-through to partners) and NOT subject to EWT.
   - "unknown" if you cannot determine
 - vendor_details.trade_name: the business/trade name (DBA). For sole proprietors, this is the shop name (e.g. "JORJEL LAUNDRY SHOP"). For corporations, same as vendor.name. Empty if not applicable.
 - vendor_details.proprietor_name: the owner/proprietor's personal name if entity is sole_proprietor. Look for keywords like "Prop.", "Owner", "Proprietor", or a personal name printed below/near the business name. Empty string if not a sole proprietor or not found.
@@ -316,6 +317,9 @@ VENDOR DETAIL REQUIREMENTS (PH):
   - "JORJEL LAUNDRY SHOP" with "JOCELYN E. SANTOS - Prop." → trade_name="JORJEL LAUNDRY SHOP", proprietor_name="JOCELYN E. SANTOS", entity_type="sole_proprietor"
   - "NONVAT Reg. TIN: 740-326-198-00000" → this is the TIN, not the proprietor
   - "SM PRIME HOLDINGS, INC." → entity_type="corporation", trade_name="SM PRIME HOLDINGS, INC.", proprietor_name=""
+  - "REYES & SANTOS LAW OFFICES" → entity_type="general_professional_partnership"
+  - "CRUZ, GARCIA & ASSOCIATES, CPAs" → entity_type="general_professional_partnership"
+  - "DELA CRUZ ACCOUNTING FIRM" (single CPA with staff, Inc.) → entity_type="corporation" (NOT GPP — it's incorporated)
 
 PH VAT RULES (IMPORTANT):
 - Decide vat.classification (BILL LEVEL — if ANY line has VAT, classification should be "vatable"):

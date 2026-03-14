@@ -1192,8 +1192,16 @@ function ewtIdByRate(taxMap, rate, vendorIsIndividual) {
 function isVendorIndividual(extracted) {
   const et = String(extracted?.vendor_details?.entity_type || "").toLowerCase();
   if (et === "individual" || et === "sole_proprietor") return true;
-  if (et === "corporation") return false;
+  if (et === "corporation" || et === "general_professional_partnership") return false;
   return undefined; // unknown — caller decides default
+}
+
+/**
+ * General Professional Partnerships (GPPs) are pass-through entities exempt from
+ * income tax under Philippine law — payments to GPPs are NOT subject to EWT.
+ */
+function isVendorGPP(extracted) {
+  return String(extracted?.vendor_details?.entity_type || "").toLowerCase() === "general_professional_partnership";
 }
 
 /**
@@ -1219,6 +1227,9 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, ext
 
   // Only PH entities get EWT
   if (country && !/philipp|^ph$/i.test(country)) return 0;
+
+  // GPPs are exempt from income tax — not subject to EWT
+  if (isVendorGPP(extracted)) return 0;
 
   const vendorIndiv = isVendorIndividual(extracted);
 
@@ -2723,6 +2734,14 @@ async function processOneDocument(args) {
     const ewtCountry = String(entityFlags?.country || "").trim();
     const isPHEntity = !ewtCountry || /philipp|^ph$/i.test(ewtCountry);
     if (isPHEntity) {
+      const vendorGPP = isVendorGPP(extracted);
+      if (vendorGPP) {
+        await safeMessagePost(
+          odoo, companyId, "account.move", Number(billId),
+          `<b>🏛️ EWT exempt</b> — Vendor classified as General Professional Partnership (GPP). ` +
+          `GPPs are pass-through entities exempt from income tax; payments are not subject to EWT.`
+        );
+      }
       const ewtMap = taxMap.ewt || {};
       const hasAnyEwt = Object.values(ewtMap).some((v) => v > 0);
       const isTwa = !!entityFlags?.isTopWithholdingAgent;
@@ -2732,7 +2751,7 @@ async function processOneDocument(args) {
       if (isTwa) ewtParts.push("Entity is a Top Withholding Agent (TWA)");
       const vendorIndiv = isVendorIndividual(extracted);
       if (vendorIndiv === true) ewtParts.push("Vendor: individual/sole proprietor (WI codes)");
-      else if (vendorIndiv === false) ewtParts.push("Vendor: corporation/juridical (WC codes)");
+      else if (vendorIndiv === false && !vendorGPP) ewtParts.push("Vendor: corporation/juridical (WC codes)");
       if (invoiceEwtDetected) {
         const detailParts = [];
         if (wht.ewt_rate) detailParts.push(`rate: ${wht.ewt_rate}%`);
